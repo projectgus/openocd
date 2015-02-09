@@ -80,6 +80,7 @@ ARMV6_SRC = \
 
 ARMV7_SRC = \
 	armv7m.c \
+	armv7m_trace.c \
 	cortex_m.c \
 	armv7a.c \
 	cortex_a.c
@@ -156,6 +157,7 @@ noinst_HEADERS = \
 	armv4_5_cache.h \
 	armv7a.h \
 	armv7m.h \
+	armv7m_trace.h \
 	avrt.h \
 	dsp563xx.h \
 	dsp563xx_once.h \
