@@ -24,7 +24,10 @@
  * - Assumes OCD debug feature.
  * - Other features/config modelled closely on lx106 (esp8266 SoC) at this time.
  * - Assumes little endian target.
- * - Assumes "DIR Array option" not configured.
+ * - Assumes none of the following options configured:
+ *   * "DIR Array option"
+ *   * "Instruction cache option" (XCHAL_ICACHE_SIZE >0 in xtensa-config.h)
+ *   * "MMU Option" (XCHAL_HAVE_MMU in xtensa-config.h)
  */
 
 #ifdef HAVE_CONFIG_H
@@ -68,6 +71,8 @@ static const struct xtensa_tap_instr tap_instrs[] = {
 	{ TAP_INS_SCAN_DCR,   0x19, 8,                    "ScanDCR"   },
 	{ TAP_INS_LOAD_WDI,   0x1a, XTENSA_INST_NUM_BITS, "LoadWDI"   },
 };
+/* Static buffer that holds the tap instructions ready for sending to JTAG */
+static uint8_t tap_instr_buf[XTENSA_NUM_TAP_INS*4];
 
 /* Debug Output Status Register (DOSR) fields */
 #define DOSR_NEXT_DI     (1<<0)
@@ -75,19 +80,57 @@ static const struct xtensa_tap_instr tap_instrs[] = {
 #define DOSR_IN_OCD_MODE (1<<2)
 #define DOSR_DOD_READY   (1<<3)
 
+/* Instruction field offsets & masks */
+#define XT_MASK_IMM8 0xFF
+#define XT_MASK_R 0x0F
+#define XT_MASK_S 0x0F
+#define XT_MASK_T 0x0F
+#define XT_MASK_SR 0xFF
+/* RRI8 */
+#define XT_OFFS_RRI8_IMM8 16
+#define XT_OFFS_RRI8_S 8
+#define XT_OFFS_RRI8_T 4
+/* RSR */
+#define _XT_INS_FORMAT_RSR(OPCODE,SR,T) (OPCODE		      \
+					 | ((SR & 0xFF) << 8) \
+					 | ((T & 0x0F) << 4))
+
+#define _XT_INS_FORMAT_RRI8(OPCODE,R,S,T,IMM8) (OPCODE			\
+						| ((IMM8 & 0xFF) << 16) \
+						| ((R & 0x0F) << 12 )	\
+						| ((S & 0x0F) << 8 )	\
+						| ((T & 0x0F) << 4 ))
+
+
+/* Special register indexes */
+#define XT_SR_DDR  104
+
 /* XTensa processor instruction opcodes
    TODO: Almost certainly host-endianness issues here
 */
-#define XT_INS_RFDO_0      (0xf1e000)    /* "Return From Debug Operation" to Normal */
-#define XT_INS_RFDO_1      (0xf1e100)    /* "Return From Debug Operation" to OCD Run */
+/* "Return From Debug Operation" to Normal */
+#define XT_INS_RFDO_0      (0xf1e000)
+/* "Return From Debug Operation" to OCD Run */
+#define XT_INS_RFDO_1      (0xf1e100)
+
+/* Load 32-bit Indirect from A(S)+4*IMM8 to A(T) */
+#define XT_INS_L32I(S,T,IMM8) _XT_INS_FORMAT_RRI8(0x002002,0,S,T,IMM8)
+/* Load 16-bit Unsigned from A(S)+2*IMM8 to A(T) */
+#define XT_INS_L16UI(S,T,IMM8) _XT_INS_FORMAT_RRI8(0x001002,0,S,T,IMM8)
+/* Load 8-bit Unsigned from A(S)+IMM8 to A(T) */
+#define XT_INS_L8UI(S,T,IMM8) _XT_INS_FORMAT_RRI8(0x000002,0,S,T,IMM8)
+
+/* Swap Special Register */
+#define XT_INS_XSR(SR,T) _XT_INS_FORMAT_RSR(0x610000,SR,T)
+/* Write Special Register */
+#define XT_INS_WSR(SR,T) _XT_INS_FORMAT_RSR(0x130000,SR,T)
 
 /* Add an XTensa OCD TAP instruction to the JTAG queue */
 static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *data_out, uint8_t *data_in)
 {
-	uint8_t ins_resp;
 	const struct xtensa_tap_instr *ins;
 	static const uint8_t dummy_out[] = {0,0,0,0};
-	
+
 	if ((inst_idx < 0 || inst_idx >= XTENSA_NUM_TAP_INS))
 		return ERROR_COMMAND_SYNTAX_ERROR;
 	ins = &tap_instrs[inst_idx];
@@ -101,7 +144,8 @@ static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *
 	LOG_DEBUG("Queueing TAP inst %s has_data_out=%d has_data_in=%d",
 		  ins->name, data_out?1:0, data_in?1:0);
 
-	jtag_add_plain_ir_scan(target->tap->ir_length, &ins->inst, &ins_resp, TAP_IDLE);
+	jtag_add_plain_ir_scan(target->tap->ir_length, tap_instr_buf+inst_idx*4,
+			       NULL, TAP_IDLE);
 	jtag_add_plain_dr_scan(ins->data_len, data_out, data_in, TAP_IDLE);
 
 	return ERROR_OK;
@@ -152,12 +196,16 @@ static int xtensa_target_create(struct target *target, Jim_Interp *interp)
 
 static int xtensa_init_target(struct command_context *cmd_ctx, struct target *target)
 {
+	int i;
 	LOG_DEBUG("%s", __func__);
 	struct xtensa_common *xtensa = target_to_xtensa(target);
 
 	xtensa->state = XT_NORMAL; // Assume normal state until we examine
 
 	/* TODO: Reset breakpoint state and build reg cache */
+
+	for(i = 0; i < XTENSA_NUM_TAP_INS; i++)
+		buf_set_u32(tap_instr_buf+4*i, 0, 32, tap_instrs[i].inst);
 
 	return ERROR_OK;
 }
@@ -167,8 +215,6 @@ static int xtensa_poll(struct target *target)
     struct xtensa_common *xtensa = target_to_xtensa(target);
     uint32_t dosr;
     int res;
-
-    usleep(500*1000); /* TODO: Remove this after confident polling is reliable!! */
 
     /* OCD guide 2.9.2 points out no reliable way to detect core reset.
 
@@ -289,23 +335,200 @@ static int xtensa_deassert_reset(struct target *target)
 	/* deassert reset lines */
 	jtag_add_reset(0, 0);
 
+	usleep(100000);
 	res = xtensa_poll(target);
 	if (res != ERROR_OK)
 		return res;
 
 	if (target->reset_halt) {
 	    /* TODO: work out if possible to halt on reset (I think "no" */
-	    LOG_WARNING("%s: 'reset halt' is not supported for XTensa."
-			"Have halted some time after resetting (not the same thing!)", __func__);
 	    res = target_halt(target);
-	    if (res != ERROR_OK)
-		return res;
+	    if (res != ERROR_OK) {
+		    LOG_ERROR("%s: failed to halt afte reset", __func__);
+		    return res;
+	    }
+	    LOG_WARNING("%s: 'reset halt' is not supported for XTensa. "
+			"Have halted some time after resetting (not the same thing!)", __func__);
 	}
 
 	LOG_DEBUG("%s", __func__);
 	return ERROR_OK;
 }
 
+/* Swap the contents of an array of register values with
+   the address register contents.
+
+   Useful for saving/restoring state.
+
+   "args" contains "count" values to be loaded into address registers. After succesful execution,
+   "args" contains the values that were loaded in these register addresses.
+*/
+static int xtensa_swap_address_regs(struct target *target, uint32_t *args, uint32_t count)
+{
+	uint8_t val_buf[4*(count+1)];
+	uint8_t inst_buf[4*count];
+	uint32_t i;
+	int res;
+
+	if(count == 0)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	/* Load values into buffer */
+	for(i = 0; i < count; i++)
+		buf_set_u32(val_buf+i*4, 0, 32, args[i]);
+	buf_set_u32(val_buf+count*4, 0, 32, 0);
+
+	/* Load DDR with first value from value buffer */
+	res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR,
+			       val_buf, NULL);
+	if(res != ERROR_OK)
+		return res;
+
+	for(i = 0; i < count; i++) {
+		/* queue XSR swap instruction */
+		buf_set_u32(inst_buf+i*4, 0, 32, XT_INS_XSR(XT_SR_DDR, i));
+		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI,
+				       inst_buf+i*4, 0);
+		if(res != ERROR_OK)
+			return res;
+
+		/* Read DDR (now with swapped value of address reg), while scanning in next value */
+		res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR,
+				       val_buf+(i+1)*4, val_buf+i*4);
+		if(res != ERROR_OK)
+			return res;
+	}
+
+	res = jtag_execute_queue();
+	if(res != ERROR_OK)
+		LOG_ERROR("%s: failed to swap %d register addresses (error on i=%d)", __func__, count, i);
+
+	for(i = 0; i < count; i++) {
+		args[i] = buf_get_u32(val_buf+i*4, 0, 32);
+	}
+	return res;
+}
+
+static int xtensa_read_memory_inner(struct target *target,
+	uint32_t address,
+	uint32_t size,
+	uint32_t count,
+	uint8_t *buffer)
+{
+	int res;
+	uint32_t inst;
+	uint8_t inst_buf[4];
+	uint8_t load_ddr_buf[4];
+	uint32_t address_regs[2] = {0};
+	uint8_t imm8;
+	static const uint8_t zeroes[4] = {0};
+
+	/* Set up a0 with the base address */
+	address_regs[0] = address;
+	xtensa_swap_address_regs(target, address_regs, 1);
+
+	/* Opcode to copy address register 1 into DDR */
+	buf_set_u32(load_ddr_buf, 0, 32, XT_INS_WSR(XT_SR_DDR, 1));
+
+	for(imm8 = 0; imm8 < count; imm8++) {
+		/* determine the load instruction (based on size) */
+		switch(size) {
+		case 4:
+			inst = XT_INS_L32I(0, 1, imm8); break;
+		case 2:
+			inst = XT_INS_L16UI(0, 1, imm8); break;
+		case 1:
+			inst = XT_INS_L8UI(0, 1, imm8); break;
+		default:
+			return ERROR_COMMAND_SYNTAX_ERROR;
+		}
+		buf_set_u32(inst_buf, 0, 32, inst);
+
+		/* queue the load instruction to the address register */
+		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, NULL);
+		if(res != ERROR_OK)
+			return res;
+
+		/* queue the load instruction from the address register to DDR */
+		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, load_ddr_buf, NULL);
+		if(res != ERROR_OK)
+			return res;
+
+		/* queue the read of DDR */
+		jtag_add_plain_ir_scan(target->tap->ir_length,
+				       tap_instr_buf+TAP_INS_SCAN_DDR*4,
+				       NULL, TAP_IDLE);
+		jtag_add_plain_dr_scan(8*size, zeroes, buffer+imm8*size, TAP_IDLE);
+	}
+	res = jtag_execute_queue();
+	if(res != ERROR_OK) {
+		LOG_ERROR("%s: JTAG scan failed", __func__);
+		return res;
+	}
+	return ERROR_OK;
+}
+
+
+static int xtensa_read_memory(struct target *target,
+	uint32_t address,
+	uint32_t size,
+	uint32_t count,
+	uint8_t *buffer)
+{
+	int res;
+	uint32_t address_regs[2] = {0}; /* a0, a1 */
+
+	if (target->state != TARGET_HALTED) {
+		LOG_WARNING("target not halted");
+		return ERROR_TARGET_NOT_HALTED;
+	}
+
+	/* sanitize arguments */
+	if (((size != 4) && (size != 2) && (size != 1)) || (count == 0) || !(buffer))
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (((size == 4) && (address & 0x3u)) || ((size == 2) && (address & 0x1u)))
+		return ERROR_TARGET_UNALIGNED_ACCESS;
+
+	/* Save a0, a1 values to swap back when completed. */
+	xtensa_swap_address_regs(target, address_regs, 2);
+
+	/* NB: if we were supporting the ICACHE option, we would need
+	 * to invalidate it here */
+
+	/* All the LxxI instructions support up to 255 offsets per
+	   instruction, so we break each read up into blocks of at
+	   most this size.
+	*/
+	while(count > 255) {
+		LOG_DEBUG("%s: splitting read from 0x%" PRIx32 " size %d count 255",__func__,
+			  address,size);
+		res = xtensa_read_memory_inner(target, address, size, 255, buffer);
+		if(res != ERROR_OK)
+			goto cleanup;
+		count -= 255;
+		address += (255 * size);
+		buffer += 255;
+	}
+	res = xtensa_read_memory_inner(target, address, size, count, buffer);
+
+cleanup:
+	/* Restore a0, a1 */
+	xtensa_swap_address_regs(target, address_regs, 2);
+
+	return res;
+}
+
+static int xtensa_write_memory(struct target *target,
+	uint32_t address,
+	uint32_t size,
+	uint32_t count,
+	const uint8_t *buffer)
+{
+	return ERROR_FAIL;
+
+        /* NB: if we were supporting the ICACHE option, we would need to invalidate it here */
+}
 
 /** Holds methods for Xtensa targets. */
 struct target_type xtensa_target = {
@@ -320,14 +543,13 @@ struct target_type xtensa_target = {
 	.assert_reset = xtensa_assert_reset,
 	.deassert_reset = xtensa_deassert_reset,
 
+	.read_memory = xtensa_read_memory,
+	.write_memory = xtensa_write_memory,
+	
 	/*
 	.get_gdb_reg_list = xtensa_get_gdb_reg_list,
 
 	.step = xtensa_step,
-
-
-	.read_memory = xtensa_read_memory_default,
-	.write_memory = xtensa_write_memory_default,
 
 	.read_buffer = xtensa_read_buffer_default,
 	.write_buffer = xtensa_write_buffer_default,
