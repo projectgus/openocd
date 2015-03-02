@@ -91,8 +91,8 @@ static uint8_t tap_instr_buf[XTENSA_NUM_TAP_INS*4];
 #define XT_OFFS_RRI8_S 8
 #define XT_OFFS_RRI8_T 4
 /* RSR */
-#define _XT_INS_FORMAT_RSR(OPCODE,SR,T) (OPCODE		      \
-					 | ((SR & 0xFF) << 8) \
+#define _XT_INS_FORMAT_RSR(OPCODE,SR,T) (OPCODE			\
+					 | ((SR & 0xFF) << 8)	\
 					 | ((T & 0x0F) << 4))
 
 #define _XT_INS_FORMAT_RRI8(OPCODE,R,S,T,IMM8) (OPCODE			\
@@ -145,7 +145,7 @@ static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *
 	ins = &tap_instrs[inst_idx];
 
 	if(!data_out)
-	    data_out = dummy_out;
+		data_out = dummy_out;
 
 	if (!target->tap)
 		return ERROR_FAIL;
@@ -221,35 +221,35 @@ static int xtensa_init_target(struct command_context *cmd_ctx, struct target *ta
 
 static int xtensa_poll(struct target *target)
 {
-    struct xtensa_common *xtensa = target_to_xtensa(target);
-    uint32_t dosr;
-    int res;
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+	uint32_t dosr;
+	int res;
 
-    /* OCD guide 2.9.2 points out no reliable way to detect core reset.
+	/* OCD guide 2.9.2 points out no reliable way to detect core reset.
 
-       So, even though this ENABLE_OCD is nearly always a No-Op, we send it
-       on every poll just in case the target has reset and gone back to Running state
-       (in which case this moves it to OCD Run State. */
-    res = xtensa_tap_queue(target, TAP_INS_ENABLE_OCD, NULL, NULL);
-    if(res != ERROR_OK) {
-	LOG_ERROR("Failed to queue EnableOCD instruction.");
-	return ERROR_FAIL;
-    }
+	   So, even though this ENABLE_OCD is nearly always a No-Op, we send it
+	   on every poll just in case the target has reset and gone back to Running state
+	   (in which case this moves it to OCD Run State. */
+	res = xtensa_tap_queue(target, TAP_INS_ENABLE_OCD, NULL, NULL);
+	if(res != ERROR_OK) {
+		LOG_ERROR("Failed to queue EnableOCD instruction.");
+		return ERROR_FAIL;
+	}
 
-    res = xtensa_tap_exec(target, TAP_INS_READ_DOSR, 0, &dosr);
-    if(res != ERROR_OK) {
-	LOG_ERROR("Failed to read DOSR. Not Xtensa OCD?");
-	return ERROR_FAIL;
-    }
+	res = xtensa_tap_exec(target, TAP_INS_READ_DOSR, 0, &dosr);
+	if(res != ERROR_OK) {
+		LOG_ERROR("Failed to read DOSR. Not Xtensa OCD?");
+		return ERROR_FAIL;
+	}
 
-    if(dosr & (DOSR_IN_OCD_MODE)) {
-	xtensa->state = XT_OCD_HALT;
-	target->state = TARGET_HALTED;
-    } else {
-	xtensa->state = XT_OCD_RUN;
-	target->state = TARGET_RUNNING;
-    }
-    return ERROR_OK;
+	if(dosr & (DOSR_IN_OCD_MODE)) {
+		xtensa->state = XT_OCD_HALT;
+		target->state = TARGET_HALTED;
+	} else {
+		xtensa->state = XT_OCD_RUN;
+		target->state = TARGET_RUNNING;
+	}
+	return ERROR_OK;
 }
 
 static int xtensa_examine(struct target *target)
@@ -278,36 +278,36 @@ static int xtensa_examine(struct target *target)
 
 static int xtensa_halt(struct target *target)
 {
-    int res;
+	int res;
 
-    if (target->state == TARGET_HALTED) {
-	LOG_DEBUG("target was already halted");
-	return ERROR_OK;
-    }
+	if (target->state == TARGET_HALTED) {
+		LOG_DEBUG("target was already halted");
+		return ERROR_OK;
+	}
 
-    res = xtensa_tap_exec(target, TAP_INS_DEBUG_INT, 0, 0);
-    if(res != ERROR_OK) {
-	LOG_ERROR("Failed to issue DebugInt instruction. Can't halt.");
-	return ERROR_FAIL;
-    }
-    return xtensa_poll(target);
+	res = xtensa_tap_exec(target, TAP_INS_DEBUG_INT, 0, 0);
+	if(res != ERROR_OK) {
+		LOG_ERROR("Failed to issue DebugInt instruction. Can't halt.");
+		return ERROR_FAIL;
+	}
+	return xtensa_poll(target);
 }
 
 static int xtensa_resume(struct target *target,
-    	int current,
-	uint32_t address,
-	int handle_breakpoints,
-	int debug_execution)
+			 int current,
+			 uint32_t address,
+			 int handle_breakpoints,
+			 int debug_execution)
 {
-    uint8_t didr[4];
-    buf_set_u32(didr, 0, 32, 0x1);
-    int res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, didr, NULL);
-    res = xtensa_tap_exec(target, TAP_INS_LOAD_DI, XT_INS_RFDO_1, 0);
-    if(res != ERROR_OK) {
-	LOG_ERROR("Failed to issue LoadDI instruction. Can't resume.");
-	return ERROR_FAIL;
-    }
-    return xtensa_poll(target);
+	uint8_t didr[4];
+	buf_set_u32(didr, 0, 32, 0x1);
+	int res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, didr, NULL);
+	res = xtensa_tap_exec(target, TAP_INS_LOAD_DI, XT_INS_RFDO_1, 0);
+	if(res != ERROR_OK) {
+		LOG_ERROR("Failed to issue LoadDI instruction. Can't resume.");
+		return ERROR_FAIL;
+	}
+	return xtensa_poll(target);
 }
 
 static int xtensa_arch_state(struct target *target)
@@ -350,14 +350,14 @@ static int xtensa_deassert_reset(struct target *target)
 		return res;
 
 	if (target->reset_halt) {
-	    /* TODO: work out if possible to halt on reset (I think "no" */
-	    res = target_halt(target);
-	    if (res != ERROR_OK) {
-		    LOG_ERROR("%s: failed to halt afte reset", __func__);
-		    return res;
-	    }
-	    LOG_WARNING("%s: 'reset halt' is not supported for XTensa. "
-			"Have halted some time after resetting (not the same thing!)", __func__);
+		/* TODO: work out if possible to halt on reset (I think "no" */
+		res = target_halt(target);
+		if (res != ERROR_OK) {
+			LOG_ERROR("%s: failed to halt afte reset", __func__);
+			return res;
+		}
+		LOG_WARNING("%s: 'reset halt' is not supported for XTensa. "
+			    "Have halted some time after resetting (not the same thing!)", __func__);
 	}
 
 	LOG_DEBUG("%s", __func__);
@@ -419,10 +419,10 @@ static int xtensa_swap_address_regs(struct target *target, uint32_t *args, uint3
 }
 
 static int xtensa_read_memory_inner(struct target *target,
-	uint32_t address,
-	uint32_t size,
-	uint32_t count,
-	uint8_t *buffer)
+				    uint32_t address,
+				    uint32_t size,
+				    uint32_t count,
+				    uint8_t *buffer)
 {
 	int res;
 	uint32_t inst;
@@ -479,10 +479,10 @@ static int xtensa_read_memory_inner(struct target *target,
 
 
 static int xtensa_read_memory(struct target *target,
-	uint32_t address,
-	uint32_t size,
-	uint32_t count,
-	uint8_t *buffer)
+			      uint32_t address,
+			      uint32_t size,
+			      uint32_t count,
+			      uint8_t *buffer)
 {
 	int res;
 	uint32_t address_regs[2] = {0}; /* a0, a1 */
@@ -521,7 +521,7 @@ static int xtensa_read_memory(struct target *target,
 	}
 	res = xtensa_read_memory_inner(target, address, size, count, buffer);
 
-cleanup:
+ cleanup:
 	/* Restore a0, a1 */
 	xtensa_swap_address_regs(target, address_regs, 2);
 
@@ -529,10 +529,10 @@ cleanup:
 }
 
 static int xtensa_write_memory_inner(struct target *target,
-	uint32_t address,
-	uint32_t size,
-	uint32_t count,
-	const uint8_t *buffer)
+				     uint32_t address,
+				     uint32_t size,
+				     uint32_t count,
+				     const uint8_t *buffer)
 {
 	int res;
 	uint32_t inst;
@@ -589,10 +589,10 @@ static int xtensa_write_memory_inner(struct target *target,
 }
 
 static int xtensa_write_memory(struct target *target,
-	uint32_t address,
-	uint32_t size,
-	uint32_t count,
-	const uint8_t *buffer)
+			       uint32_t address,
+			       uint32_t size,
+			       uint32_t count,
+			       const uint8_t *buffer)
 {
 	/* NOTE FOR LATER: This function is almost identical to
 	   xtensa_read_memory, and can possibly be converted into a common
@@ -633,7 +633,7 @@ static int xtensa_write_memory(struct target *target,
 	}
 	res = xtensa_write_memory_inner(target, address, size, count, buffer);
 
-cleanup:
+ cleanup:
 	/* NB: if we were supporting the ICACHE option, we would need
 	 * to invalidate it here */
 
@@ -658,23 +658,23 @@ struct target_type xtensa_target = {
 
 	.read_memory = xtensa_read_memory,
 	.write_memory = xtensa_write_memory,
-	
+
 	/*
-	.get_gdb_reg_list = xtensa_get_gdb_reg_list,
+	  .get_gdb_reg_list = xtensa_get_gdb_reg_list,
 
-	.step = xtensa_step,
+	  .step = xtensa_step,
 
-	.read_buffer = xtensa_read_buffer_default,
-	.write_buffer = xtensa_write_buffer_default,
+	  .read_buffer = xtensa_read_buffer_default,
+	  .write_buffer = xtensa_write_buffer_default,
 
-	.run_algorithm = xtensa_run_algorithm,
+	  .run_algorithm = xtensa_run_algorithm,
 
-	.add_breakpoint = xtensa_add_breakpoint,
-	.remove_breakpoint = xtensa_remove_breakpoint,
-	.add_watchpoint = xtensa_add_watchpoint,
-	.remove_watchpoint = xtensa_remove_watchpoint,
+	  .add_breakpoint = xtensa_add_breakpoint,
+	  .remove_breakpoint = xtensa_remove_breakpoint,
+	  .add_watchpoint = xtensa_add_watchpoint,
+	  .remove_watchpoint = xtensa_remove_watchpoint,
 
-	.commands = xtensa_command_handlers,
+	  .commands = xtensa_command_handlers,
 	*/
 	.target_create = xtensa_target_create,
 	.init_target = xtensa_init_target,
