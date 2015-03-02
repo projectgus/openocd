@@ -114,16 +114,25 @@ static uint8_t tap_instr_buf[XTENSA_NUM_TAP_INS*4];
 #define XT_INS_RFDO_1      (0xf1e100)
 
 /* Load 32-bit Indirect from A(S)+4*IMM8 to A(T) */
-#define XT_INS_L32I(S,T,IMM8) _XT_INS_FORMAT_RRI8(0x002002,0,S,T,IMM8)
+#define XT_INS_L32I(S,T,IMM8)  _XT_INS_FORMAT_RRI8(0x002002,0,S,T,IMM8)
 /* Load 16-bit Unsigned from A(S)+2*IMM8 to A(T) */
 #define XT_INS_L16UI(S,T,IMM8) _XT_INS_FORMAT_RRI8(0x001002,0,S,T,IMM8)
 /* Load 8-bit Unsigned from A(S)+IMM8 to A(T) */
-#define XT_INS_L8UI(S,T,IMM8) _XT_INS_FORMAT_RRI8(0x000002,0,S,T,IMM8)
+#define XT_INS_L8UI(S,T,IMM8)  _XT_INS_FORMAT_RRI8(0x000002,0,S,T,IMM8)
 
-/* Swap Special Register */
-#define XT_INS_XSR(SR,T) _XT_INS_FORMAT_RSR(0x610000,SR,T)
+/* Store 32-bit Indirect to A(S)+4*IMM8 from A(T) */
+#define XT_INS_S32I(S,T,IMM8) _XT_INS_FORMAT_RRI8(0x006002,0,S,T,IMM8)
+/* Store 16-bit to A(S)+2*IMM8 from A(T) */
+#define XT_INS_S16I(S,T,IMM8) _XT_INS_FORMAT_RRI8(0x005002,0,S,T,IMM8)
+/* Store 8-bit to A(S)+IMM8 from A(T) */
+#define XT_INS_S8I(S,T,IMM8)  _XT_INS_FORMAT_RRI8(0x004002,0,S,T,IMM8)
+
+/* Rear Special Register */
+#define XT_INS_RSR(SR,T) _XT_INS_FORMAT_RSR(0x030000,SR,T)
 /* Write Special Register */
 #define XT_INS_WSR(SR,T) _XT_INS_FORMAT_RSR(0x130000,SR,T)
+/* Swap Special Register */
+#define XT_INS_XSR(SR,T) _XT_INS_FORMAT_RSR(0x610000,SR,T)
 
 /* Add an XTensa OCD TAP instruction to the JTAG queue */
 static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *data_out, uint8_t *data_in)
@@ -519,15 +528,119 @@ cleanup:
 	return res;
 }
 
+static int xtensa_write_memory_inner(struct target *target,
+	uint32_t address,
+	uint32_t size,
+	uint32_t count,
+	const uint8_t *buffer)
+{
+	int res;
+	uint32_t inst;
+	uint8_t inst_buf[4];
+	uint8_t load_ddr_buf[4];
+	uint8_t data_buf[4] = {0};
+	uint32_t address_regs[2] = {0};
+	uint8_t imm8;
+
+	/* Set up a0 with the base address */
+	address_regs[0] = address;
+	xtensa_swap_address_regs(target, address_regs, 1);
+
+	/* Opcode to copy address DDR into register 1 */
+	buf_set_u32(load_ddr_buf, 0, 32, XT_INS_RSR(XT_SR_DDR, 1));
+
+	for(imm8 = 0; imm8 < count; imm8++) {
+		/* determine the store instruction (based on size) */
+		switch(size) {
+		case 4:
+			inst = XT_INS_S32I(0, 1, imm8); break;
+		case 2:
+			inst = XT_INS_S16I(0, 1, imm8); break;
+		case 1:
+			inst = XT_INS_S8I(0, 1, imm8); break;
+		default:
+			return ERROR_COMMAND_SYNTAX_ERROR;
+		}
+		buf_set_u32(inst_buf, 0, 32, inst);
+
+		/* queue the data to store to DDR (always write 32 bits to DDR) */
+		memcpy(data_buf, buffer+imm8*size, size);
+		res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, data_buf, NULL);
+		if(res != ERROR_OK)
+			return res;
+
+		/* queue the load instruction DDR to the address register */
+		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, load_ddr_buf, NULL);
+		if(res != ERROR_OK)
+			return res;
+
+		/* queue the store instruction to the address register */
+		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, NULL);
+		if(res != ERROR_OK)
+			return res;
+	}
+	res = jtag_execute_queue();
+	if(res != ERROR_OK) {
+		LOG_ERROR("%s: JTAG scan failed", __func__);
+		return res;
+	}
+
+	return ERROR_OK;
+}
+
 static int xtensa_write_memory(struct target *target,
 	uint32_t address,
 	uint32_t size,
 	uint32_t count,
 	const uint8_t *buffer)
 {
-	return ERROR_FAIL;
+	/* NOTE FOR LATER: This function is almost identical to
+	   xtensa_read_memory, and can possibly be converted into a common
+	   wrapper function. The only problem is the 'const uint8_t
+	   *buffer' rather than the non-const read function version... :(.
+	   */
+	int res;
+	uint32_t address_regs[2] = {0}; /* a0, a1 */
 
-        /* NB: if we were supporting the ICACHE option, we would need to invalidate it here */
+	if (target->state != TARGET_HALTED) {
+		LOG_WARNING("target not halted");
+		return ERROR_TARGET_NOT_HALTED;
+	}
+
+	/* sanitize arguments */
+	if (((size != 4) && (size != 2) && (size != 1)) || (count == 0) || !(buffer))
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (((size == 4) && (address & 0x3u)) || ((size == 2) && (address & 0x1u)))
+		return ERROR_TARGET_UNALIGNED_ACCESS;
+
+	/* Save a0, a1 values to swap back when completed. */
+	xtensa_swap_address_regs(target, address_regs, 2);
+
+	/* All the LxxI instructions support up to 255 offsets per
+	   instruction, so we break each read up into blocks of at
+	   most this size.
+	*/
+	while(count > 255) {
+		LOG_DEBUG("%s: splitting read from 0x%" PRIx32 " size %d count 255",__func__,
+			  address,size);
+		res = xtensa_write_memory_inner(target, address, size, 255, buffer);
+		if(res != ERROR_OK)
+			goto cleanup;
+		count -= 255;
+		address += (255 * size);
+		buffer += 255;
+	}
+	res = xtensa_write_memory_inner(target, address, size, count, buffer);
+
+cleanup:
+	/* NB: if we were supporting the ICACHE option, we would need
+	 * to invalidate it here */
+
+	/* Restore a0, a1 */
+	xtensa_swap_address_regs(target, address_regs, 2);
+
+	return res;
 }
 
 /** Holds methods for Xtensa targets. */
