@@ -86,13 +86,14 @@ static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *
 {
 	uint8_t ins_resp;
 	const struct xtensa_tap_instr *ins;
-
+	static const uint8_t dummy_out[] = {0,0,0,0};
+	
 	if ((inst_idx < 0 || inst_idx >= XTENSA_NUM_TAP_INS))
 		return ERROR_COMMAND_SYNTAX_ERROR;
 	ins = &tap_instrs[inst_idx];
 
-	if(ins->data_len > 0 && !data_out)
-		return ERROR_COMMAND_SYNTAX_ERROR;
+	if(!data_out)
+	    data_out = dummy_out;
 
 	if (!target->tap)
 		return ERROR_FAIL;
@@ -101,9 +102,7 @@ static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *
 		  ins->name, data_out?1:0, data_in?1:0);
 
 	jtag_add_plain_ir_scan(target->tap->ir_length, &ins->inst, &ins_resp, TAP_IDLE);
-	if(data_out) {
-		jtag_add_plain_dr_scan(ins->data_len, data_out, data_in, TAP_IDLE);
-	}
+	jtag_add_plain_dr_scan(ins->data_len, data_out, data_in, TAP_IDLE);
 
 	return ERROR_OK;
 }
@@ -163,43 +162,6 @@ static int xtensa_init_target(struct command_context *cmd_ctx, struct target *ta
 	return ERROR_OK;
 }
 
-static int xtensa_examine(struct target *target)
-{
-	int res;
-	struct xtensa_common *xtensa = target_to_xtensa(target);
-
-	if (!target_was_examined(target)) {
-		target_set_examined(target);
-
-		/* without IDCODE, the best we can do to check this is a
-		   valid XTensa core is to try and transition
-		   from "Normal" mode to OCDRunMode... */
-		res = xtensa_tap_exec(target, TAP_INS_ENABLE_OCD, 0, NULL);
-		if(res != ERROR_OK) {
-			LOG_ERROR("Failed to execute EnableOCD instruction. Not XTensa OCD?");
-			return ERROR_FAIL;
-		}
-
-		uint32_t dosr;
-		res = xtensa_tap_exec(target, TAP_INS_READ_DOSR, 0, &dosr);
-		if(res != ERROR_OK) {
-			LOG_ERROR("Failed to read DOSR. Not Xtensa OCD?");
-			return ERROR_FAIL;
-		}
-
-		if(dosr & (DOSR_NEXT_DI|DOSR_IN_OCD_MODE)) {
-			xtensa->state = XT_OCD_HALT;
-		} else {
-			xtensa->state = XT_OCD_RUN;
-		}
-
-		/* TODO: Clear breakpoint state here as much as possible. */
-	}
-
-	return ERROR_OK;
-}
-
-
 static int xtensa_poll(struct target *target)
 {
     struct xtensa_common *xtensa = target_to_xtensa(target);
@@ -207,7 +169,18 @@ static int xtensa_poll(struct target *target)
     int res;
 
     usleep(500*1000); /* TODO: Remove this after confident polling is reliable!! */
-    
+
+    /* OCD guide 2.9.2 points out no reliable way to detect core reset.
+
+       So, even though this ENABLE_OCD is nearly always a No-Op, we send it
+       on every poll just in case the target has reset and gone back to Running state
+       (in which case this moves it to OCD Run State. */
+    res = xtensa_tap_queue(target, TAP_INS_ENABLE_OCD, NULL, NULL);
+    if(res != ERROR_OK) {
+	LOG_ERROR("Failed to queue EnableOCD instruction.");
+	return ERROR_FAIL;
+    }
+
     res = xtensa_tap_exec(target, TAP_INS_READ_DOSR, 0, &dosr);
     if(res != ERROR_OK) {
 	LOG_ERROR("Failed to read DOSR. Not Xtensa OCD?");
@@ -223,6 +196,30 @@ static int xtensa_poll(struct target *target)
     }
     return ERROR_OK;
 }
+
+static int xtensa_examine(struct target *target)
+{
+	int res;
+
+	if (!target_was_examined(target)) {
+		target_set_examined(target);
+
+		/* without IDCODE, there isn't actually a lot we can
+		   do here apart from try to poll and check that the
+		   TAP responds to it, ie has some known XTensa
+		   registers. */
+		res = xtensa_poll(target);
+		if(res != ERROR_OK) {
+			LOG_ERROR("Failed to examine target.");
+			return ERROR_FAIL;
+		}
+
+		/* TODO: Clear breakpoint state here as much as possible. */
+	}
+
+	return ERROR_OK;
+}
+
 
 static int xtensa_halt(struct target *target)
 {
@@ -264,6 +261,51 @@ static int xtensa_arch_state(struct target *target)
 	return ERROR_OK;
 }
 
+static int xtensa_assert_reset(struct target *target)
+{
+	enum reset_types jtag_reset_config = jtag_get_reset_config();
+
+	if (jtag_reset_config & RESET_HAS_SRST) {
+		/* default to asserting srst */
+		if (jtag_reset_config & RESET_SRST_PULLS_TRST)
+			jtag_add_reset(1, 1);
+		else
+			jtag_add_reset(0, 1);
+	}
+
+	target->state = TARGET_RESET;
+	jtag_add_sleep(5000);
+
+	/* TODO: invalidate register cache, once we have one */
+
+	LOG_DEBUG("%s", __func__);
+	return ERROR_OK;
+}
+
+static int xtensa_deassert_reset(struct target *target)
+{
+	int res;
+
+	/* deassert reset lines */
+	jtag_add_reset(0, 0);
+
+	res = xtensa_poll(target);
+	if (res != ERROR_OK)
+		return res;
+
+	if (target->reset_halt) {
+	    /* TODO: work out if possible to halt on reset (I think "no" */
+	    LOG_WARNING("%s: 'reset halt' is not supported for XTensa."
+			"Have halted some time after resetting (not the same thing!)", __func__);
+	    res = target_halt(target);
+	    if (res != ERROR_OK)
+		return res;
+	}
+
+	LOG_DEBUG("%s", __func__);
+	return ERROR_OK;
+}
+
 
 /** Holds methods for Xtensa targets. */
 struct target_type xtensa_target = {
@@ -275,13 +317,14 @@ struct target_type xtensa_target = {
 	.halt = xtensa_halt,
 	.resume = xtensa_resume,
 
+	.assert_reset = xtensa_assert_reset,
+	.deassert_reset = xtensa_deassert_reset,
+
 	/*
 	.get_gdb_reg_list = xtensa_get_gdb_reg_list,
 
 	.step = xtensa_step,
 
-	.assert_reset = xtensa_assert_reset,
-	.deassert_reset = xtensa_deassert_reset,
 
 	.read_memory = xtensa_read_memory_default,
 	.write_memory = xtensa_write_memory_default,
