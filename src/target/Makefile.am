@@ -40,6 +40,7 @@ libtarget_la_SOURCES = \
 	dsp563xx.c \
 	dsp563xx_once.c \
 	dsp5680xx.c \
+	xtensa.c \
 	hla_target.c
 
 TARGET_CORE_SRC = \
@@ -198,7 +199,8 @@ noinst_HEADERS = \
 	nds32_v3m.h \
 	nds32_aice.h \
 	lakemont.h \
-	x86_32_common.h
+	x86_32_common.h \
+	xtensa.h
 
 ocddatadir = $(pkglibdir)
 nobase_dist_ocddata_DATA =
