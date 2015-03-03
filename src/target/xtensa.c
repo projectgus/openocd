@@ -19,7 +19,7 @@
  ***************************************************************************/
 
 /*
- * XTensa arch target implementation. Very preliminary & restricted in scope:
+ * Xtensa arch target implementation. Very preliminary & restricted in scope:
  *
  * - Assumes OCD debug feature.
  * - Other features/config modelled closely on lx106 (esp8266 SoC) at this time.
@@ -55,7 +55,7 @@
  *                        Xtensa OCD TAP instructions              *
  *******************************************************************/
 
-/* XTensa OCD TAP instructions */
+/* Xtensa OCD TAP instructions */
 enum xtensa_tap_ins_idx {
 	TAP_INS_ENABLE_OCD  = 0,
 	TAP_INS_DEBUG_INT = 1,
@@ -234,7 +234,7 @@ static const struct xtensa_core_reg xt_regs[] = {
 #define XT_SR_ICOUNT      0xec
 #define XT_SR_ICOUNTLEVEL 0xed
 
-/* XTensa processor instruction opcodes
+/* Xtensa processor instruction opcodes
    TODO: Almost certainly host-endianness issues here
 */
 /* "Return From Debug Operation" to Normal */
@@ -270,7 +270,7 @@ static int xtensa_save_context(struct target *target);
 static int xtensa_restore_context(struct target *target);
 
 
-/* Add an XTensa OCD TAP instruction to the JTAG queue */
+/* Add an Xtensa OCD TAP instruction to the JTAG queue */
 static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *data_out, uint8_t *data_in)
 {
 	const struct xtensa_tap_instr *ins;
@@ -293,7 +293,7 @@ static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *
 	return ERROR_OK;
 }
 
-/* Execute an XTensa OCD TAP instruction immediately */
+/* Execute an Xtensa OCD TAP instruction immediately */
 static int xtensa_tap_exec(struct target *target, int inst_idx, uint32_t data_out, uint32_t *data_in)
 {
 	uint8_t out[4] = { 0 }, in[4] = { 0 };
@@ -493,7 +493,7 @@ static int xtensa_examine(struct target *target)
 
 		/* without IDCODE, there isn't actually a lot we can
 		   do here apart from try to poll and check that the
-		   TAP responds to it, ie has some known XTensa
+		   TAP responds to it, ie has some known Xtensa
 		   registers. */
 		res = xtensa_poll(target);
 		if(res != ERROR_OK) {
@@ -535,7 +535,7 @@ static int xtensa_resume(struct target *target,
 	uint8_t buf[4];
 	int res;
 
-	LOG_INFO("%s", __func__);
+	LOG_INFO("%s current=%d address=%04" PRIx32, __func__, current, address);
 
 	if (target->state != TARGET_HALTED) {
 		LOG_WARNING("%s: target not halted", __func__);
@@ -660,7 +660,7 @@ static int xtensa_deassert_reset(struct target *target)
 			LOG_ERROR("%s: failed to halt afte reset", __func__);
 			return res;
 		}
-		LOG_WARNING("%s: 'reset halt' is not supported for XTensa. "
+		LOG_WARNING("%s: 'reset halt' is not supported for Xtensa. "
 			    "Have halted some time after resetting (not the same thing!)", __func__);
 	}
 
@@ -1095,9 +1095,6 @@ static int xtensa_get_gdb_reg_list(struct target *target,
 	int i;
 	struct xtensa_common *xtensa = target_to_xtensa(target);
 
-	if (target->state != TARGET_HALTED)
-		return ERROR_TARGET_NOT_HALTED;
-
 	*reg_list_size = XT_NUM_REGS;
 	*reg_list = malloc(sizeof(struct reg *) * (*reg_list_size));
 
@@ -1130,10 +1127,6 @@ struct target_type xtensa_target = {
 	.get_gdb_reg_list = xtensa_get_gdb_reg_list,
 
 	/*
-
-	  .read_buffer = xtensa_read_buffer_default,
-	  .write_buffer = xtensa_write_buffer_default,
-
 	  .run_algorithm = xtensa_run_algorithm,
 
 	  .add_breakpoint = xtensa_add_breakpoint,
