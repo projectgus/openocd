@@ -154,6 +154,9 @@ enum xtensa_reg_idx {
 
 #define XT_NUM_REGS 50
 
+/* PC register isn't directly accessible, it's EPC(DEBUGLEVEL) instead */
+#define XT_REG_IDX_PC_ALIAS (XT_REG_IDX_EPC1-1+XT_DEBUGLEVEL)
+
 static const struct xtensa_core_reg xt_regs[] = {
 	{ XT_REG_IDX_A0, "a0",                     0x00, XT_REG_GENERAL, 0 },
 	{ XT_REG_IDX_A1, "a1",                     0x01, XT_REG_GENERAL, 0 },
@@ -228,8 +231,6 @@ static const struct xtensa_core_reg xt_regs[] = {
    TODO: Make this a smart macro or something
 */
 #define XT_SR_DDR         0x68
-#define XT_SR_EPC(LEVEL)  (0xb0+LEVEL)
-#define XT_SR_EPS(LEVEL)  (0xc0+LEVEL)
 #define XT_SR_ICOUNT      0xec
 #define XT_SR_ICOUNTLEVEL 0xed
 
@@ -285,9 +286,6 @@ static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *
 	if (!target->tap)
 		return ERROR_FAIL;
 
-	LOG_DEBUG("Queueing TAP inst %s has_data_out=%d has_data_in=%d",
-		  ins->name, data_out?1:0, data_in?1:0);
-
 	jtag_add_plain_ir_scan(target->tap->ir_length, tap_instr_buf+inst_idx*4,
 			       NULL, TAP_IDLE);
 	jtag_add_plain_dr_scan(ins->data_len, data_out, data_in, TAP_IDLE);
@@ -324,6 +322,81 @@ static int xtensa_tap_exec(struct target *target, int inst_idx, uint32_t data_ou
 	}
 
 	return ERROR_OK;
+}
+
+/* Set up a register we intend to use for scratch purposes */
+static int xtensa_setup_scratch_reg(struct target *target, int reg_idx)
+{
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+	struct reg *reg_list = xtensa->core_cache->reg_list;
+	int res;
+	if (reg_idx < 0 || reg_idx >= XT_NUM_REGS)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (!reg_list[reg_idx].valid) {
+		res = xtensa_get_core_reg(&reg_list[reg_idx]);
+		if (res != ERROR_OK)
+			return res;
+	}
+	reg_list[reg_idx].dirty = 1;
+	return ERROR_OK;
+}
+
+
+/* Queue an Xtensa CPU instruction via the TAP's LoadDI function */
+static inline int xtensa_tap_queue_cpu_inst(struct target *target, uint32_t inst)
+{
+	uint8_t inst_buf[4];
+	buf_set_u32(inst_buf, 0, 32, inst);
+	return xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, NULL);
+}
+
+
+/* Queue a load to a general register aX, via DDR  */
+static inline int xtensa_tap_queue_load_general_reg(struct target *target, uint8_t general_reg_num, uint32_t value)
+{
+	uint8_t value_buf[4];
+	int res;
+	buf_set_u32(value_buf, 0, 32, value);
+	res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, value_buf, NULL);
+	if(res != ERROR_OK)
+		return res;
+	return xtensa_tap_queue_cpu_inst(target, XT_INS_RSR(XT_SR_DDR, general_reg_num));
+}
+
+
+/* Queue a write to an Xtensa special register, via the WSR instruction.
+
+   This function does not go through the gdb-facing register cache.
+*/
+static int xtensa_tap_queue_write_sr(struct target *target, int idx, uint32_t value)
+{
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+	struct reg *reg_list = xtensa->core_cache->reg_list;
+	struct reg *reg;
+	struct xtensa_core_reg *xt_reg;
+	int res;
+
+	if(idx < 0 || idx >= XT_NUM_REGS)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	reg = &reg_list[idx];
+	xt_reg = reg->arch_info;
+
+	if(xt_reg->type != XT_REG_SPECIAL)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	/* Use a0 as working register */
+	xtensa_setup_scratch_reg(target, XT_REG_IDX_A0);
+
+	/* Push new value into a0 via DDR */
+	res = xtensa_tap_queue_load_general_reg(target, 0, value);
+	if(res != ERROR_OK)
+		return res;
+	/* load Special Register from a0 */
+	res = xtensa_tap_queue_cpu_inst(target, XT_INS_WSR(xt_reg->reg_num, 0));
+
+	return res;
 }
 
 static int xtensa_target_create(struct target *target, Jim_Interp *interp)
@@ -460,8 +533,14 @@ static int xtensa_resume(struct target *target,
 {
 	struct xtensa_common *xtensa = target_to_xtensa(target);
 	uint8_t buf[4];
-	
+	int res;
+
 	LOG_INFO("%s", __func__);
+
+	if (target->state != TARGET_HALTED) {
+		LOG_WARNING("%s: target not halted", __func__);
+		return ERROR_TARGET_NOT_HALTED;
+	}
 
 	if(address && !current) {
 		buf_set_u32(buf, 0, 32, address);
@@ -470,7 +549,7 @@ static int xtensa_resume(struct target *target,
 	xtensa_restore_context(target);
 	register_cache_invalidate(xtensa->core_cache);
 
-	int res = xtensa_tap_exec(target, TAP_INS_LOAD_DI, XT_INS_RFDO_1, 0);
+	res = xtensa_tap_exec(target, TAP_INS_LOAD_DI, XT_INS_RFDO_1, 0);
 	if(res != ERROR_OK) {
 		LOG_ERROR("Failed to issue LoadDI instruction. Can't resume.");
 		return ERROR_FAIL;
@@ -486,48 +565,23 @@ static int xtensa_step(struct target *target,
 	struct xtensa_common *xtensa = target_to_xtensa(target);
 	struct reg *reg_list = xtensa->core_cache->reg_list;
 	int res;
-	uint8_t buf[4];
 	uint32_t dosr;
 	static const uint32_t icount_val = -2; /* ICOUNT value to load for 1 step */
 	if (target->state != TARGET_HALTED) {
-		LOG_WARNING("target not halted");
+		LOG_WARNING("%s: target not halted", __func__);
 		return ERROR_TARGET_NOT_HALTED;
 	}
 
-	/* Mark A0 as invalid, about to use it for working reg */
-	if(!reg_list[XT_REG_IDX_A0].valid)
-		xtensa_get_core_reg(&reg_list[XT_REG_IDX_A0]);
-	reg_list[XT_REG_IDX_A0].dirty = 1;
+	/* working reg a0 */
+	xtensa_setup_scratch_reg(target, XT_REG_IDX_A0);
 
-	/* load debug level into DDR */
-	buf_set_u32(buf, 0, 32, XT_DEBUGLEVEL);
-	res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, buf, NULL);
+	/* Load debug level into ICOUNTLEVEL */
+	res = xtensa_tap_queue_write_sr(target, XT_REG_IDX_ICOUNTLEVEL, XT_DEBUGLEVEL);
 	if(res != ERROR_OK)
 		return res;
 
-	/* read debug level from DDR to a0 */
-	buf_set_u32(buf, 0, 32, XT_INS_RSR(XT_SR_DDR, 0));
-	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, buf, 0);
-	if(res != ERROR_OK)
-		return res;
-	/* write with debug level a0 to ICOUNTLEVEL reg */
-	buf_set_u32(buf, 0, 32, XT_INS_WSR(XT_SR_ICOUNTLEVEL, 0));
-	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, buf, 0);
-	if(res != ERROR_OK)
-		return res;
-
-	/* push new value for ICOUNT into DDR, while reading out saved a0 */
-	res = xtensa_tap_exec(target, TAP_INS_SCAN_DDR, icount_val,NULL);
-	if(res != ERROR_OK)
-		return res;
-	/* read next value (ICOUNT) from DDR into a0 */
-	buf_set_u32(buf, 0, 32, XT_INS_RSR(XT_SR_DDR, 0));
-	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, buf, 0);
-	if(res != ERROR_OK)
-		return res;
-	/* load ICOUNT from a0 */
-	buf_set_u32(buf, 0, 32, XT_INS_WSR(XT_SR_ICOUNT, 0));
-	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, buf, 0);
+	/* load ICOUNT step count value */
+	res = xtensa_tap_queue_write_sr(target, XT_REG_IDX_ICOUNT, icount_val);
 	if(res != ERROR_OK)
 		return res;
 
@@ -622,26 +676,14 @@ static int xtensa_read_memory_inner(struct target *target,
 {
 	int res;
 	uint32_t inst;
-	uint8_t inst_buf[4];
-	uint8_t load_ddr_buf[4];
-	uint8_t data_buf[4];
 	uint8_t imm8;
 	static const uint8_t zeroes[4] = {0};
 
 	/* Load DDR with base address, save to register a0 */
-	buf_set_u32(data_buf, 0, 32, address);
-	res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, data_buf, NULL);
+	/* Push base base address to a0 via DDR */
+	res = xtensa_tap_queue_load_general_reg(target, 0, address);
 	if(res != ERROR_OK)
 		return res;
-
-	/* Save DDR with base address to a0 */
-	buf_set_u32(load_ddr_buf, 0, 32, XT_INS_RSR(XT_SR_DDR, 0));
-	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, load_ddr_buf, NULL);
-	if(res != ERROR_OK)
-		return res;
-
-	/* Opcode to copy address register 1 into DDR */
-	buf_set_u32(load_ddr_buf, 0, 32, XT_INS_WSR(XT_SR_DDR, 1));
 
 	for(imm8 = 0; imm8 < count; imm8++) {
 		/* determine the load instruction (based on size) */
@@ -655,19 +697,17 @@ static int xtensa_read_memory_inner(struct target *target,
 		default:
 			return ERROR_COMMAND_SYNTAX_ERROR;
 		}
-		buf_set_u32(inst_buf, 0, 32, inst);
-
 		/* queue the load instruction to the address register */
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, NULL);
+		res = xtensa_tap_queue_cpu_inst(target, inst);
 		if(res != ERROR_OK)
 			return res;
 
 		/* queue the load instruction from the address register to DDR */
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, load_ddr_buf, NULL);
+		res = xtensa_tap_queue_cpu_inst(target, XT_INS_WSR(XT_SR_DDR, 1));
 		if(res != ERROR_OK)
 			return res;
 
-		/* queue the read of DDR */
+		/* queue the read of DDR - note specific length to avoid buffer overrun */
 		jtag_add_plain_ir_scan(target->tap->ir_length,
 				       tap_instr_buf+TAP_INS_SCAN_DDR*4,
 				       NULL, TAP_IDLE);
@@ -689,9 +729,7 @@ static int xtensa_read_memory(struct target *target,
 			      uint8_t *buffer)
 {
 	int res;
-	struct xtensa_common *xtensa = target_to_xtensa(target);
-	struct reg *reg_list = xtensa->core_cache->reg_list;
-	
+
 	if (target->state != TARGET_HALTED) {
 		LOG_WARNING("target not halted");
 		return ERROR_TARGET_NOT_HALTED;
@@ -705,12 +743,8 @@ static int xtensa_read_memory(struct target *target,
 		return ERROR_TARGET_UNALIGNED_ACCESS;
 
 	/* Read & dirty a0 & a1 as we're going to use them as working regs */
-	if(!reg_list[XT_REG_IDX_A0].valid)
-		xtensa_get_core_reg(&reg_list[XT_REG_IDX_A0]);
-	if(!reg_list[XT_REG_IDX_A1].valid)
-		xtensa_get_core_reg(&reg_list[XT_REG_IDX_A1]);
-	reg_list[XT_REG_IDX_A0].dirty = 1;
-	reg_list[XT_REG_IDX_A1].dirty = 1;
+	xtensa_setup_scratch_reg(target, XT_REG_IDX_A0);
+	xtensa_setup_scratch_reg(target, XT_REG_IDX_A1);
 
 	/* NB: if we were supporting the ICACHE option, we would need
 	 * to invalidate it here */
@@ -742,27 +776,20 @@ static int xtensa_write_memory_inner(struct target *target,
 {
 	int res;
 	uint32_t inst;
-	uint8_t inst_buf[4];
-	uint8_t load_ddr_buf[4];
-	uint8_t data_buf[4] = {0};
 	uint8_t imm8;
 
-	/* Load DDR with base address, save to register a0 */
-	buf_set_u32(data_buf, 0, 32, address);
-	res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, data_buf, NULL);
+	/* Push base address to a0 via DDR */
+	res = xtensa_tap_queue_load_general_reg(target, 0, address);
 	if(res != ERROR_OK)
 		return res;
-
-	/* Save DDR with base address to a0 */
-	buf_set_u32(load_ddr_buf, 0, 32, XT_INS_RSR(XT_SR_DDR, 0));
-	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, load_ddr_buf, NULL);
-	if(res != ERROR_OK)
-		return res;
-
-	/* Opcode to save DDR to a1 (used for actual data to write) */
-	buf_set_u32(load_ddr_buf, 0, 32, XT_INS_RSR(XT_SR_DDR, 1));
 
 	for(imm8 = 0; imm8 < count; imm8++) {
+		/* load next word from buffer into a1, via DDR */
+		res = xtensa_tap_queue_load_general_reg(target, 1,
+							buf_get_u32(buffer+imm8*size, 0, 8*size));
+		if(res != ERROR_OK)
+			return res;
+
 		/* determine the store instruction (based on size) */
 		switch(size) {
 		case 4:
@@ -774,21 +801,8 @@ static int xtensa_write_memory_inner(struct target *target,
 		default:
 			return ERROR_COMMAND_SYNTAX_ERROR;
 		}
-		buf_set_u32(inst_buf, 0, 32, inst);
-
-		/* queue the data to store to DDR (always write 32 bits to DDR) */
-		memcpy(data_buf, buffer+imm8*size, size);
-		res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, data_buf, NULL);
-		if(res != ERROR_OK)
-			return res;
-
-		/* queue the load instruction DDR to the address register */
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, load_ddr_buf, NULL);
-		if(res != ERROR_OK)
-			return res;
-
 		/* queue the store instruction to the address register */
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, NULL);
+		res = xtensa_tap_queue_cpu_inst(target, inst);
 		if(res != ERROR_OK)
 			return res;
 	}
@@ -813,8 +827,6 @@ static int xtensa_write_memory(struct target *target,
 	   *buffer' rather than the non-const read function version... :(.
 	   */
 	int res;
-	struct xtensa_common *xtensa = target_to_xtensa(target);
-	struct reg *reg_list = xtensa->core_cache->reg_list;
 
 	if (target->state != TARGET_HALTED) {
 		LOG_WARNING("target not halted");
@@ -829,12 +841,8 @@ static int xtensa_write_memory(struct target *target,
 		return ERROR_TARGET_UNALIGNED_ACCESS;
 
 	/* Read & dirty a0 & a1 as we're going to use them as working regs */
-	if(!reg_list[XT_REG_IDX_A0].valid)
-		xtensa_get_core_reg(&reg_list[XT_REG_IDX_A0]);
-	if(!reg_list[XT_REG_IDX_A1].valid)
-		xtensa_get_core_reg(&reg_list[XT_REG_IDX_A1]);
-	reg_list[XT_REG_IDX_A0].dirty = 1;
-	reg_list[XT_REG_IDX_A1].dirty = 1;
+	xtensa_setup_scratch_reg(target, XT_REG_IDX_A0);
+	xtensa_setup_scratch_reg(target, XT_REG_IDX_A1);
 
 	/* All the LxxI instructions support up to 255 offsets per
 	   instruction, so we break each read up into blocks of at
@@ -858,14 +866,13 @@ static int xtensa_write_memory(struct target *target,
 	return res;
 }
 
+/* Read register value from target. This function goes via the gdb-facing register cache. */
 static int xtensa_read_register(struct target *target, int idx, int force)
 {
 	struct xtensa_common *xtensa = target_to_xtensa(target);
 	struct reg *reg_list = xtensa->core_cache->reg_list;
 	struct reg *reg;
 	struct xtensa_core_reg *xt_reg;
-	uint32_t load_inst;
-	uint8_t inst_buf[4];
 	uint32_t reg_value;
 	uint8_t read_reg_buf[4];
 	int res;
@@ -876,9 +883,10 @@ static int xtensa_read_register(struct target *target, int idx, int force)
 	reg = &reg_list[idx];
 	xt_reg = reg->arch_info;
 
-	LOG_DEBUG("%s %s", __func__, reg->name);
+	LOG_DEBUG("%s %s valid=%d dirty=%d force=%d", __func__, reg->name,
+		  reg->valid, reg->dirty, force);
 
-	if(reg->valid && !force)
+	if((reg->valid && !force) || reg->dirty)
 		return ERROR_OK; /* Still OK */
 
 	if (target->state != TARGET_HALTED)
@@ -886,8 +894,7 @@ static int xtensa_read_register(struct target *target, int idx, int force)
 
 	if(xt_reg->type == XT_REG_GENERAL) {
 		/* Access via WSR from general reg Ax to DDR */
-		buf_set_u32(inst_buf, 0, 32, XT_INS_WSR(XT_SR_DDR,xt_reg->reg_num));
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, NULL);
+		res = xtensa_tap_queue_cpu_inst(target, XT_INS_WSR(XT_SR_DDR,xt_reg->reg_num));
 		if(res != ERROR_OK)
 			return res;
 		xtensa_tap_queue(target, TAP_INS_SCAN_DDR, NULL, read_reg_buf);
@@ -898,28 +905,18 @@ static int xtensa_read_register(struct target *target, int idx, int force)
 		/* Otherwise, access is via a special register read via a0 */
 
 		/* Store a0 as being used as scratch reg */
-		if(!reg_list[XT_REG_IDX_A0].valid)
-			xtensa_get_core_reg(&reg_list[XT_REG_IDX_A0]);
-		reg_list[XT_REG_IDX_A0].dirty = 1;
+		xtensa_setup_scratch_reg(target, XT_REG_IDX_A0);
 
-		switch(xt_reg->type) {
-		case XT_REG_PC:
-			load_inst = XT_INS_RSR(XT_SR_EPC(XT_DEBUGLEVEL), 0); break;
-		case XT_REG_SPECIAL:
-			load_inst = XT_INS_RSR(xt_reg->reg_num, 0); break;
-		default:
-			return ERROR_FAIL;
+		if(xt_reg->type == XT_REG_PC) {
+			/* Replace PC register with the EPC reg we use as alias */
+			xt_reg = reg_list[XT_REG_IDX_PC_ALIAS].arch_info;
 		}
 
 		/* RSR to read special reg to a0, then WSR to DDR, then scan via OCD */
-		buf_set_u32(inst_buf, 0, 32, load_inst);
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, 0);
+		res = xtensa_tap_queue_cpu_inst(target, XT_INS_RSR(xt_reg->reg_num, 0));
 		if(res != ERROR_OK)
 			return res;
-		buf_set_u32(inst_buf, 0, 32, XT_INS_WSR(XT_SR_DDR, 0));
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, 0);
-		if(res != ERROR_OK)
-			return res;
+		res = xtensa_tap_queue_cpu_inst(target, XT_INS_WSR(XT_SR_DDR, 0));
 		res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, NULL, read_reg_buf);
 		if(res != ERROR_OK)
 			return res;
@@ -946,10 +943,8 @@ static int xtensa_write_register(struct target *target, int idx)
 	struct reg *reg_list = xtensa->core_cache->reg_list;
 	struct reg *reg;
 	struct xtensa_core_reg *xt_reg;
-	uint32_t store_inst;
-	uint8_t inst_buf[4];
-	const int sr_num_epc = XT_SR_EPC(XT_DEBUGLEVEL);
-	int res, i;
+	uint32_t value;
+	int res;
 
 	if (target->state != TARGET_HALTED)
 		return ERROR_TARGET_NOT_HALTED;
@@ -960,50 +955,27 @@ static int xtensa_write_register(struct target *target, int idx)
 	reg = &reg_list[idx];
 	xt_reg = reg->arch_info;
 
-	LOG_DEBUG("%s %s", __func__, reg->name);
+	LOG_DEBUG("%s %s dirty=%d value=%04"PRIx32, __func__, reg->name,
+		  reg->dirty, buf_get_u32(reg->value, 0, 32));
 
 	if(!reg->dirty)
 		return ERROR_OK;
 
 	if(xt_reg->type == XT_REG_GENERAL) {
-		/* RSR from DDR to general reg Ax */
-		res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, NULL, reg->value);
-		if(res != ERROR_OK)
-			return res;
-		buf_set_u32(inst_buf, 0, 32, XT_INS_RSR(XT_SR_DDR,xt_reg->reg_num));
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, NULL, inst_buf);
+		/* Load new register value to general register Ax via DDR */
+		res = xtensa_tap_queue_load_general_reg(target, xt_reg->reg_num,
+							buf_get_u32(reg->value, 0, 32));
 		if(res != ERROR_OK)
 			return res;
 	}
 	else {
-		/* Otherwise, access is via a special register write via a0 */
-
-		/* Store a0 as being used as scratch reg */
-		if(!reg_list[XT_REG_IDX_A0].valid)
-			xtensa_get_core_reg(&reg_list[XT_REG_IDX_A0]);
-		reg_list[XT_REG_IDX_A0].dirty = 1;
-
-		switch(xt_reg->type) {
-		case XT_REG_PC:
-			store_inst = XT_INS_WSR(sr_num_epc, 0); break;
-		case XT_REG_SPECIAL:
-			store_inst = XT_INS_WSR(xt_reg->reg_num, 0); break;
-		default:
-			return ERROR_FAIL;
+		/* Special register load */
+		if(xt_reg->type == XT_REG_PC) {
+			/* Replace PC with its EPC alias register (the one we can actually touch) */
+			xt_reg = reg_list[XT_REG_IDX_PC_ALIAS].arch_info;
 		}
-
-		/* scan new register value to DDR */
-		res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, reg->value, NULL);
-		if(res != ERROR_OK)
-			return res;
-		/* RSR DDR to a0 */
-		buf_set_u32(inst_buf, 0, 32, XT_INS_RSR(XT_SR_DDR, 0));
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, NULL);
-		if(res != ERROR_OK)
-			return res;
-		/* WSR a0 to special reg */
-		buf_set_u32(inst_buf, 0, 32, store_inst);
-		res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, inst_buf, NULL);
+		value = buf_get_u32(reg->value, 0, 32);
+		res = xtensa_tap_queue_write_sr(target, xt_reg->reg_num, value);
 		if(res != ERROR_OK)
 			return res;
 	}
@@ -1015,20 +987,19 @@ static int xtensa_write_register(struct target *target, int idx)
 	/* If we just wrote to the PC register or the EPC register we
 	   use as its alias, make sure to invalidate the other aliased
 	   register */
-	if(xt_reg->type == XT_REG_PC
-	   || (xt_reg->type==XT_REG_SPECIAL && xt_reg->reg_num==sr_num_epc)) {
-		for(i = 0; i < XT_NUM_REGS; i++) {
-			xt_reg = reg_list[i].arch_info;
-			if(xt_reg->type == XT_REG_PC
-			   || (xt_reg->type==XT_REG_SPECIAL && xt_reg->reg_num==sr_num_epc)) {
-				reg_list[i].valid = 0;
-				reg_list[i].dirty = 0;
-			}
-		}
+	if(idx == XT_REG_IDX_PC) {
+		reg_list[XT_REG_IDX_PC_ALIAS].valid = 0;
+		reg_list[XT_REG_IDX_PC_ALIAS].dirty = 0;
+	} else if(idx == XT_REG_IDX_PC_ALIAS) {
+		reg_list[XT_REG_IDX_PC].valid = 0;
+		reg_list[XT_REG_IDX_PC].dirty = 0;
 	}
 
 	reg->valid = 1;
 	reg->dirty = 0;
+
+	xtensa_read_register(target, idx, 1); /* TODO: this is a debug check */
+
 	return ERROR_OK;
 }
 
@@ -1102,7 +1073,6 @@ static void xtensa_build_reg_cache(struct target *target)
 	cache->num_regs = XT_NUM_REGS;
 	(*cache_p)= cache;
 	xtensa->core_cache = cache;
-	xtensa->reg_values = calloc(XT_NUM_REGS, sizeof(uint32_t));
 
 	for(i = 0; i < XT_NUM_REGS; i++) {
 		arch_info[i] = xt_regs[i];

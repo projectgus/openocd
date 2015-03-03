@@ -34,7 +34,6 @@ struct xtensa_common {
 	struct jtag_tap *tap;
 	enum xtensa_state state;
 	struct reg_cache *core_cache;
-	uint32_t *reg_values;
 };
 
 struct xtensa_tap_instr {
