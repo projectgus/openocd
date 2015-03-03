@@ -227,9 +227,11 @@ static const struct xtensa_core_reg xt_regs[] = {
 
    TODO: Make this a smart macro or something
 */
-#define XT_SR_DDR 0x68
-#define XT_SR_EPC(LEVEL) (0xb0+LEVEL)
-#define XT_SR_EPS(LEVEL) (0xc0+LEVEL)
+#define XT_SR_DDR         0x68
+#define XT_SR_EPC(LEVEL)  (0xb0+LEVEL)
+#define XT_SR_EPS(LEVEL)  (0xc0+LEVEL)
+#define XT_SR_ICOUNT      0xec
+#define XT_SR_ICOUNTLEVEL 0xed
 
 /* XTensa processor instruction opcodes
    TODO: Almost certainly host-endianness issues here
@@ -262,6 +264,7 @@ static const struct xtensa_core_reg xt_regs[] = {
 
 /* Forward declarations */
 static int xtensa_get_core_reg(struct reg *reg);
+static int xtensa_set_core_reg(struct reg *reg, uint8_t *buf);
 static int xtensa_save_context(struct target *target);
 static int xtensa_restore_context(struct target *target);
 
@@ -446,7 +449,7 @@ static int xtensa_halt(struct target *target)
 		LOG_ERROR("Failed to issue DebugInt instruction. Can't halt.");
 		return ERROR_FAIL;
 	}
-	return xtensa_poll(target);
+	return ERROR_OK;
 }
 
 static int xtensa_resume(struct target *target,
@@ -455,18 +458,24 @@ static int xtensa_resume(struct target *target,
 			 int handle_breakpoints,
 			 int debug_execution)
 {
-	uint8_t didr[4];
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+	uint8_t buf[4];
+	
+	LOG_INFO("%s", __func__);
 
+	if(address && !current) {
+		buf_set_u32(buf, 0, 32, address);
+		xtensa_set_core_reg(&xtensa->core_cache->reg_list[XT_REG_IDX_PC], buf);
+	}
 	xtensa_restore_context(target);
+	register_cache_invalidate(xtensa->core_cache);
 
-	buf_set_u32(didr, 0, 32, 0x1);
-	int res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, didr, NULL);
-	res = xtensa_tap_exec(target, TAP_INS_LOAD_DI, XT_INS_RFDO_1, 0);
+	int res = xtensa_tap_exec(target, TAP_INS_LOAD_DI, XT_INS_RFDO_1, 0);
 	if(res != ERROR_OK) {
 		LOG_ERROR("Failed to issue LoadDI instruction. Can't resume.");
 		return ERROR_FAIL;
 	}
-	return xtensa_poll(target);
+	return ERROR_OK;
 }
 
 static int xtensa_step(struct target *target,
@@ -474,12 +483,79 @@ static int xtensa_step(struct target *target,
 	uint32_t address,
 	int handle_breakpoints)
 {
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+	struct reg *reg_list = xtensa->core_cache->reg_list;
+	int res;
+	uint8_t buf[4];
+	uint32_t dosr;
+	static const uint32_t icount_val = -2; /* ICOUNT value to load for 1 step */
 	if (target->state != TARGET_HALTED) {
 		LOG_WARNING("target not halted");
 		return ERROR_TARGET_NOT_HALTED;
 	}
 
-	return ERROR_FAIL;
+	/* Mark A0 as invalid, about to use it for working reg */
+	if(!reg_list[XT_REG_IDX_A0].valid)
+		xtensa_get_core_reg(&reg_list[XT_REG_IDX_A0]);
+	reg_list[XT_REG_IDX_A0].dirty = 1;
+
+	/* load debug level into DDR */
+	buf_set_u32(buf, 0, 32, XT_DEBUGLEVEL);
+	res = xtensa_tap_queue(target, TAP_INS_SCAN_DDR, buf, NULL);
+	if(res != ERROR_OK)
+		return res;
+
+	/* read debug level from DDR to a0 */
+	buf_set_u32(buf, 0, 32, XT_INS_RSR(XT_SR_DDR, 0));
+	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, buf, 0);
+	if(res != ERROR_OK)
+		return res;
+	/* write with debug level a0 to ICOUNTLEVEL reg */
+	buf_set_u32(buf, 0, 32, XT_INS_WSR(XT_SR_ICOUNTLEVEL, 0));
+	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, buf, 0);
+	if(res != ERROR_OK)
+		return res;
+
+	/* push new value for ICOUNT into DDR, while reading out saved a0 */
+	res = xtensa_tap_exec(target, TAP_INS_SCAN_DDR, icount_val,NULL);
+	if(res != ERROR_OK)
+		return res;
+	/* read next value (ICOUNT) from DDR into a0 */
+	buf_set_u32(buf, 0, 32, XT_INS_RSR(XT_SR_DDR, 0));
+	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, buf, 0);
+	if(res != ERROR_OK)
+		return res;
+	/* load ICOUNT from a0 */
+	buf_set_u32(buf, 0, 32, XT_INS_WSR(XT_SR_ICOUNT, 0));
+	res = xtensa_tap_queue(target, TAP_INS_LOAD_DI, buf, 0);
+	if(res != ERROR_OK)
+		return res;
+
+	res = jtag_execute_queue();
+	if(res != ERROR_OK)
+		return res;
+
+	/* Now ICOUNT is set, we can resume as if we were going to run */
+	res = xtensa_resume(target, current, address, 0, 0);
+	if(res != ERROR_OK) {
+		LOG_ERROR("%s: Failed to resume after setting up single step", __func__);
+		return res;
+	}
+
+	/* Wait for stepping to complete */
+	do {
+		res = xtensa_tap_exec(target, TAP_INS_READ_DOSR, 0, &dosr);
+		if(res != ERROR_OK) {
+			LOG_ERROR("Failed to read DOSR. Not Xtensa OCD?");
+			return ERROR_FAIL;
+		}
+	} while((dosr & (DOSR_IN_OCD_MODE|DOSR_EXCEPTION)) == 0);
+
+	xtensa_save_context(target);
+	target->debug_reason = DBG_REASON_SINGLESTEP;
+	target_call_event_callbacks(target, TARGET_EVENT_HALTED);
+	LOG_INFO("halted: PC: 0x%" PRIx32, buf_get_u32(reg_list[XT_REG_IDX_PC].value, 0, 32));
+	return ERROR_OK;
 }
 
 
@@ -491,6 +567,7 @@ static int xtensa_arch_state(struct target *target)
 
 static int xtensa_assert_reset(struct target *target)
 {
+	struct xtensa_common *xtensa = target_to_xtensa(target);
 	enum reset_types jtag_reset_config = jtag_get_reset_config();
 
 	if (jtag_reset_config & RESET_HAS_SRST) {
@@ -504,7 +581,7 @@ static int xtensa_assert_reset(struct target *target)
 	target->state = TARGET_RESET;
 	jtag_add_sleep(5000);
 
-	/* TODO: invalidate register cache, once we have one */
+	register_cache_invalidate(xtensa->core_cache);
 
 	LOG_DEBUG("%s", __func__);
 	return ERROR_OK;
