@@ -23,6 +23,7 @@
 
 #include <jtag/jtag.h>
 
+
 enum xtensa_state {
 	XT_NORMAL,
 	XT_OCD_RUN,
@@ -32,6 +33,8 @@ enum xtensa_state {
 struct xtensa_common {
 	struct jtag_tap *tap;
 	enum xtensa_state state;
+	struct reg_cache *core_cache;
+	uint32_t *reg_values;
 };
 
 struct xtensa_tap_instr {
@@ -46,5 +49,18 @@ static inline struct xtensa_common *target_to_xtensa(struct target *target)
 	return (struct xtensa_common *)target->arch_info;
 }
 
+enum xt_reg_t {
+	XT_REG_GENERAL = 0,
+	XT_REG_PC = 1,
+	XT_REG_SPECIAL = 2,
+};
+
+struct xtensa_core_reg {
+	uint32_t idx; /* gdb server access index */
+	const char *name;
+	uint8_t reg_num; /* ISA register num (meaning depends on register type) */
+	enum xt_reg_t type;
+	struct target *target;
+};
 
 #endif /* XTENSA_H */
