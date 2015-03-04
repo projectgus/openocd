@@ -223,19 +223,14 @@ static const struct xtensa_core_reg xt_regs[] = {
 						| ((R & 0x0F) << 12 )	\
 						| ((S & 0x0F) << 8 )	\
 						| ((T & 0x0F) << 4 ))
-/* Special register indexes
-   These can be derived from the regnum field in the register table, above,
-   but because they're frequently used in the debugger code we've extracted
-   them here to their own constants.
 
-   TODO: Make this a smart macro or something
-*/
-#define XT_SR_DDR         0x68
-#define XT_SR_ICOUNT      0xec
-#define XT_SR_ICOUNTLEVEL 0xed
+/* Special register number macro for DDR register.
+ * this gets used a lot so making a shortcut to it is
+ * useful.
+ */
+#define XT_SR_DDR         (xt_regs[XT_REG_IDX_DDR].reg_num)
 
 /* Xtensa processor instruction opcodes
-   TODO: Almost certainly host-endianness issues here
 */
 /* "Return From Debug Operation" to Normal */
 #define XT_INS_RFDO_0      0xf1e000
@@ -424,7 +419,7 @@ static int xtensa_init_target(struct command_context *cmd_ctx, struct target *ta
 
 	xtensa->state = XT_NORMAL; // Assume normal state until we examine
 
-	/* TODO: Reset breakpoint state and build reg cache */
+	/* TODO: Reset breakpoint state */
 
 	/* pre-seed TAP instruction buffer with tap instruction opcodes */
 	for(i = 0; i < XTENSA_NUM_TAP_INS; i++)
