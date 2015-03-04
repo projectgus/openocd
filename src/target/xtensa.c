@@ -460,7 +460,7 @@ static int xtensa_poll(struct target *target)
 	if(dosr & (DOSR_IN_OCD_MODE)) {
 		if(target->state != TARGET_HALTED) {
 			if(target->state != TARGET_UNKNOWN && (dosr & DOSR_EXCEPTION) == 0) {
-				LOG_WARNING("%s: DOSR has set InOCDMode without the Exception flag. Unexpected. DOSR=%02x",
+				LOG_WARNING("%s: DOSR has set InOCDMode without the Exception flag. Unexpected. DOSR=0x%02x",
 					    __func__, dosr);
 			}
 			if(target->state == TARGET_DEBUG_RUNNING) {
@@ -536,7 +536,7 @@ static int xtensa_resume(struct target *target,
 	uint8_t buf[4];
 	int res;
 
-	LOG_INFO("%s current=%d address=%04" PRIx32, __func__, current, address);
+	LOG_DEBUG("%s current=%d address=%04" PRIx32, __func__, current, address);
 
 	if (target->state != TARGET_HALTED) {
 		LOG_WARNING("%s: target not halted", __func__);
@@ -573,11 +573,24 @@ static int xtensa_step(struct target *target,
 		return ERROR_TARGET_NOT_HALTED;
 	}
 
-	/* working reg a0 */
-	xtensa_setup_scratch_reg(target, XT_REG_IDX_A0);
+	LOG_DEBUG("%s current=%d address=%"PRIx32, __func__, current, address);
 
-	/* Load debug level into ICOUNTLEVEL */
-	res = xtensa_tap_queue_write_sr(target, XT_REG_IDX_ICOUNTLEVEL, XT_DEBUGLEVEL);
+	/* Load debug level into ICOUNTLEVEL
+
+	   Originally had DEBUGLEVEL (ie 2) set here, not 1, but
+	   seemed to result in occasionally stepping out into
+	   inaccessible bits of ROM (low level interrupt handlers?)
+	   and never quite recovering... One loop started at
+	   0x40000050. Re-attaching with ICOUNTLEVEL 1 caused this to
+	   immediately step into an interrupt handler.
+
+	   ICOUNTLEVEL 1 still steps into interrupt handlers, but also
+	   seems to recover.
+
+	   TODO: Experiment more, look into CPU exception nuances,
+	   consider making this step level a configuration command.
+	 */
+	res = xtensa_tap_queue_write_sr(target, XT_REG_IDX_ICOUNTLEVEL, 1);
 	if(res != ERROR_OK)
 		return res;
 
@@ -589,6 +602,15 @@ static int xtensa_step(struct target *target,
 	res = jtag_execute_queue();
 	if(res != ERROR_OK)
 		return res;
+
+	/* Wait for everything to settle, seems necessary to avoid bad resumes */
+	do {
+		res = xtensa_tap_exec(target, TAP_INS_READ_DOSR, 0, &dosr);
+		if(res != ERROR_OK) {
+			LOG_ERROR("Failed to read DOSR. Not Xtensa OCD?");
+			return ERROR_FAIL;
+		}
+	} while(!(dosr & DOSR_IN_OCD_MODE) || (dosr & DOSR_EXCEPTION));
 
 	/* Now ICOUNT is set, we can resume as if we were going to run */
 	res = xtensa_resume(target, current, address, 0, 0);
@@ -604,7 +626,15 @@ static int xtensa_step(struct target *target,
 			LOG_ERROR("Failed to read DOSR. Not Xtensa OCD?");
 			return ERROR_FAIL;
 		}
-	} while((dosr & (DOSR_IN_OCD_MODE|DOSR_EXCEPTION)) == 0);
+	} while(!(dosr & DOSR_IN_OCD_MODE) || (dosr & DOSR_EXCEPTION));
+
+	/* write ICOUNTLEVEL back to zero */
+	res = xtensa_tap_queue_write_sr(target, XT_REG_IDX_ICOUNTLEVEL, 0);
+	if(res != ERROR_OK)
+		return res;
+	res = jtag_execute_queue();
+	if(res != ERROR_OK)
+		return res;
 
 	xtensa_save_context(target);
 	target->debug_reason = DBG_REASON_SINGLESTEP;
@@ -1009,8 +1039,6 @@ static int xtensa_write_register(struct target *target, int idx)
 
 	reg->valid = 1;
 	reg->dirty = 0;
-
-	xtensa_read_register(target, idx, 1); /* TODO: this is a debug check */
 
 	return ERROR_OK;
 }
