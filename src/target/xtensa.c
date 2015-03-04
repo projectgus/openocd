@@ -459,7 +459,7 @@ static int xtensa_poll(struct target *target)
 
 	if(dosr & (DOSR_IN_OCD_MODE)) {
 		if(target->state != TARGET_HALTED) {
-			if((dosr & DOSR_EXCEPTION) == 0) {
+			if(target->state != TARGET_UNKNOWN && (dosr & DOSR_EXCEPTION) == 0) {
 				LOG_WARNING("%s: DOSR has set InOCDMode without the Exception flag. Unexpected. DOSR=%02x",
 					    __func__, dosr);
 			}
