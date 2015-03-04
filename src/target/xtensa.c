@@ -472,6 +472,7 @@ static int xtensa_poll(struct target *target)
 			xtensa->state = XT_OCD_HALT;
 			target->state = TARGET_HALTED;
 			xtensa_save_context(target);
+			register_cache_invalidate(xtensa->core_cache);
 
 			LOG_DEBUG("target->state: %s", target_state_name(target));
 			pc = &xtensa->core_cache->reg_list[XT_REG_IDX_PC];
