@@ -757,13 +757,18 @@ static int xtensa_read_memory(struct target *target,
 		LOG_DEBUG("%s: splitting read from 0x%" PRIx32 " size %d count 255",__func__,
 			  address,size);
 		res = xtensa_read_memory_inner(target, address, size, 255, buffer);
-		if(res != ERROR_OK)
+		if(res != ERROR_OK) {
+			LOG_ERROR("%s: inner read failed at address 0x%" PRIx32, __func__, address);
 			return res;
+		}
 		count -= 255;
 		address += (255 * size);
-		buffer += 255;
+		buffer += (255 * size);
 	}
 	res = xtensa_read_memory_inner(target, address, size, count, buffer);
+	if(res != ERROR_OK) {
+		LOG_ERROR("%s: final read failed at address 0x%" PRIx32, __func__, address);
+	}
 
 	return res;
 }
@@ -852,13 +857,19 @@ static int xtensa_write_memory(struct target *target,
 		LOG_DEBUG("%s: splitting read from 0x%" PRIx32 " size %d count 255",__func__,
 			  address,size);
 		res = xtensa_write_memory_inner(target, address, size, 255, buffer);
-		if(res != ERROR_OK)
+		if(res != ERROR_OK) {
+			LOG_ERROR("%s: inner write failed at address 0x%" PRIx32, __func__, address);
+
 			return res;
+		}
 		count -= 255;
 		address += (255 * size);
-		buffer += 255;
+		buffer += (255 * size);
 	}
 	res = xtensa_write_memory_inner(target, address, size, count, buffer);
+	if(res != ERROR_OK) {
+		LOG_ERROR("%s: final write failed at address 0x%" PRIx32, __func__, address);
+	}
 
 	/* NB: if we were supporting the ICACHE option, we would need
 	 * to invalidate it here */
