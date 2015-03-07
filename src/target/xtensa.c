@@ -364,19 +364,12 @@ static inline int xtensa_tap_queue_load_general_reg(struct target *target, uint8
 
    This function does not go through the gdb-facing register cache.
 */
-static int xtensa_tap_queue_write_sr(struct target *target, int idx, uint32_t value)
+
+static int xtensa_tap_queue_write_sr_ptr(struct target *target,
+					 struct xtensa_core_reg *xt_reg,
+					 uint32_t value)
 {
-	struct xtensa_common *xtensa = target_to_xtensa(target);
-	struct reg *reg_list = xtensa->core_cache->reg_list;
-	struct reg *reg;
-	struct xtensa_core_reg *xt_reg;
 	int res;
-
-	if(idx < 0 || idx >= XT_NUM_REGS)
-		return ERROR_COMMAND_SYNTAX_ERROR;
-
-	reg = &reg_list[idx];
-	xt_reg = reg->arch_info;
 
 	if(xt_reg->type != XT_REG_SPECIAL)
 		return ERROR_COMMAND_SYNTAX_ERROR;
@@ -392,6 +385,21 @@ static int xtensa_tap_queue_write_sr(struct target *target, int idx, uint32_t va
 	res = xtensa_tap_queue_cpu_inst(target, XT_INS_WSR(xt_reg->reg_num, 0));
 
 	return res;
+}
+
+static int xtensa_tap_queue_write_sr(struct target *target, int idx, uint32_t value)
+{
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+	struct reg *reg_list = xtensa->core_cache->reg_list;
+	struct reg *reg;
+	struct xtensa_core_reg *xt_reg;
+
+	if(idx < 0 || idx >= XT_NUM_REGS)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	reg = &reg_list[idx];
+	xt_reg = reg->arch_info;
+	return xtensa_tap_queue_write_sr_ptr(target, xt_reg, value);
 }
 
 static int xtensa_target_create(struct target *target, Jim_Interp *interp)
@@ -1012,7 +1020,7 @@ static int xtensa_write_register(struct target *target, int idx)
 			xt_reg = reg_list[XT_REG_IDX_PC_ALIAS].arch_info;
 		}
 		value = buf_get_u32(reg->value, 0, 32);
-		res = xtensa_tap_queue_write_sr(target, xt_reg->reg_num, value);
+		res = xtensa_tap_queue_write_sr_ptr(target, xt_reg, value);
 		if(res != ERROR_OK)
 			return res;
 	}
@@ -1035,6 +1043,10 @@ static int xtensa_write_register(struct target *target, int idx)
 	reg->valid = 1;
 	reg->dirty = 0;
 
+	/* We could trash a0 here. Restore it if we did. */
+	if (xt_reg->type != XT_REG_GENERAL && reg_list[XT_REG_IDX_A0].dirty) {
+		xtensa_write_register(target, 0);
+	}
 	return ERROR_OK;
 }
 
