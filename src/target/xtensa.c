@@ -37,6 +37,7 @@
 #include "target.h"
 #include "target_type.h"
 #include "register.h"
+#include "assert.h"
 
 #include "xtensa.h"
 
@@ -1100,7 +1101,7 @@ static void xtensa_build_reg_cache(struct target *target)
 	struct reg *reg_list = calloc(XT_NUM_REGS, sizeof(struct reg));
 	struct xtensa_core_reg *arch_info = malloc(
 			sizeof(struct xtensa_core_reg) * XT_NUM_REGS);
-	int i;
+	uint8_t i;
 
 	cache->name = "Xtensa registers";
 	cache->next = NULL;
@@ -1110,6 +1111,7 @@ static void xtensa_build_reg_cache(struct target *target)
 	xtensa->core_cache = cache;
 
 	for(i = 0; i < XT_NUM_REGS; i++) {
+		assert(xt_regs[i].idx == i && "xt_regs[] entry idx field should match index in array");
 		arch_info[i] = xt_regs[i];
 		arch_info[i].target = target;
 		reg_list[i].name = arch_info[i].name;
