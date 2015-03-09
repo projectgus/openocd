@@ -702,28 +702,36 @@ static int xtensa_read_memory_inner(struct target *target,
 				    uint8_t *buffer)
 {
 	int res;
-	uint32_t inst;
 	uint8_t imm8;
 	static const uint8_t zeroes[4] = {0};
+	uint8_t *aligned_buffer;
+	uint32_t aligned_address;
+	uint32_t aligned_size;
+
+	/* Instead of loading COUNT chunks of SIZE load aligned 32-bit words
+	 * that cover requested range. They are more likely to succeed with
+	 * IRAM/IROM.
+	 */
+	aligned_address = address & ~3;
+	aligned_size = ((address + size * count + 3) & ~3) - aligned_address;
 
 	/* Load DDR with base address, save to register a0 */
 	/* Push base base address to a0 via DDR */
-	res = xtensa_tap_queue_load_general_reg(target, 0, address);
+	res = xtensa_tap_queue_load_general_reg(target, 0, aligned_address);
 	if(res != ERROR_OK)
 		return res;
 
-	for(imm8 = 0; imm8 < count; imm8++) {
-		/* determine the load instruction (based on size) */
-		switch(size) {
-		case 4:
-			inst = XT_INS_L32I(0, 1, imm8); break;
-		case 2:
-			inst = XT_INS_L16UI(0, 1, imm8); break;
-		case 1:
-			inst = XT_INS_L8UI(0, 1, imm8); break;
-		default:
-			return ERROR_COMMAND_SYNTAX_ERROR;
-		}
+	/* Use intermediate buffer if size of aligned read doesn't match output
+	 * buffer size.
+	 */
+	if (aligned_size != size * count)
+		aligned_buffer = alloca(aligned_size);
+	else
+		aligned_buffer = buffer;
+
+	for(imm8 = 0; imm8 < aligned_size / 4; imm8++) {
+		uint32_t inst = XT_INS_L32I(0, 1, imm8);
+
 		/* queue the load instruction to the address register */
 		res = xtensa_tap_queue_cpu_inst(target, inst);
 		if(res != ERROR_OK)
@@ -738,13 +746,15 @@ static int xtensa_read_memory_inner(struct target *target,
 		jtag_add_plain_ir_scan(target->tap->ir_length,
 				       tap_instr_buf+TAP_INS_SCAN_DDR*4,
 				       NULL, TAP_IDLE);
-		jtag_add_plain_dr_scan(8*size, zeroes, buffer+imm8*size, TAP_IDLE);
+		jtag_add_plain_dr_scan(32, zeroes, aligned_buffer + imm8 * 4, TAP_IDLE);
 	}
 	res = jtag_execute_queue();
 	if(res != ERROR_OK) {
 		LOG_ERROR("%s: JTAG scan failed", __func__);
 		return res;
 	}
+	if (aligned_buffer != buffer)
+		memcpy(buffer, aligned_buffer + (address & 3), size * count);
 	return ERROR_OK;
 }
 
