@@ -1081,7 +1081,11 @@ static int xtensa_restore_context(struct target *target)
 	if (target->state != TARGET_HALTED)
 		return ERROR_TARGET_NOT_HALTED;
 
-	for(i = 0; i < XT_NUM_REGS; i++) {
+	/* Write back registers in reverse order, because SRs (higher
+	   indices) can use general registers (lower indices) as
+	   part of writeback, thereby invalidating them.
+	*/
+	for(i = XT_NUM_REGS-1; i >= 0; i--) {
 		xtensa_write_register(target, i);
 	}
 	return ERROR_OK;
