@@ -155,9 +155,6 @@ enum xtensa_reg_idx {
 
 #define XT_NUM_REGS 50
 
-/* PC register isn't directly accessible, it's EPC(DEBUGLEVEL) instead */
-#define XT_REG_IDX_PC_ALIAS (XT_REG_IDX_EPC1-1+XT_DEBUGLEVEL)
-
 static const struct xtensa_core_reg xt_regs[] = {
 	{ XT_REG_IDX_A0, "a0",                     0x00, XT_REG_GENERAL, 0 },
 	{ XT_REG_IDX_A1, "a1",                     0x01, XT_REG_GENERAL, 0 },
@@ -175,12 +172,12 @@ static const struct xtensa_core_reg xt_regs[] = {
 	{ XT_REG_IDX_A13, "a13",                   0x0d, XT_REG_GENERAL, 0 },
 	{ XT_REG_IDX_A14, "a14",                   0x0e, XT_REG_GENERAL, 0 },
 	{ XT_REG_IDX_A15, "a15",                   0x0f, XT_REG_GENERAL, 0 },
-	{ XT_REG_IDX_PC,  "PC",                    0x20, XT_REG_PC     , 0 },
+	{ XT_REG_IDX_PC,  "PC",                    0xb0, XT_REG_ALIASED, 0 },
 	{ XT_REG_IDX_SAR, "SAR",                   0x03, XT_REG_SPECIAL, 0 },
 	{ XT_REG_IDX_LITBASE,      "LITBASE",      0x05, XT_REG_SPECIAL, 0 },
 	{ XT_REG_IDX_SR176,        "SR176",        0xb0, XT_REG_SPECIAL, 0 },
 	{ XT_REG_IDX_SR208,        "SR208",        0xd0, XT_REG_SPECIAL, 0 },
-	{ XT_REG_IDX_PS,           "PS",           0xe6, XT_REG_SPECIAL, 0 },
+	{ XT_REG_IDX_PS,           "PS",           0xc0, XT_REG_ALIASED, 0 },
 	{ XT_REG_IDX_MMID,         "MMID",         0x59, XT_REG_SPECIAL, 0 },
 	{ XT_REG_IDX_IBREAKENABLE, "IBREAKENABLE", 0x60, XT_REG_SPECIAL, 0 },
 	{ XT_REG_IDX_DDR,          "DDR",          0x68, XT_REG_SPECIAL, 0 },
@@ -945,11 +942,6 @@ static int xtensa_read_register(struct target *target, int idx, int force)
 		/* Store a0 as being used as scratch reg */
 		xtensa_setup_scratch_reg(target, XT_REG_IDX_A0);
 
-		if(xt_reg->type == XT_REG_PC) {
-			/* Replace PC register with the EPC reg we use as alias */
-			xt_reg = reg_list[XT_REG_IDX_PC_ALIAS].arch_info;
-		}
-
 		/* RSR to read special reg to a0, then WSR to DDR, then scan via OCD */
 		res = xtensa_tap_queue_cpu_inst(target, XT_INS_RSR(xt_reg->reg_num, 0));
 		if(res != ERROR_OK)
@@ -980,9 +972,9 @@ static int xtensa_write_register(struct target *target, int idx)
 	struct xtensa_common *xtensa = target_to_xtensa(target);
 	struct reg *reg_list = xtensa->core_cache->reg_list;
 	struct reg *reg;
-	struct xtensa_core_reg *xt_reg;
+	struct xtensa_core_reg *xt_reg, *xt_alias;
 	uint32_t value;
-	int res;
+	int res, i;
 
 	if (target->state != TARGET_HALTED)
 		return ERROR_TARGET_NOT_HALTED;
@@ -1008,10 +1000,6 @@ static int xtensa_write_register(struct target *target, int idx)
 	}
 	else {
 		/* Special register load */
-		if(xt_reg->type == XT_REG_PC) {
-			/* Replace PC with its EPC alias register (the one we can actually touch) */
-			xt_reg = reg_list[XT_REG_IDX_PC_ALIAS].arch_info;
-		}
 		value = buf_get_u32(reg->value, 0, 32);
 		res = xtensa_tap_queue_write_sr(target, xt_reg->idx, value);
 		if(res != ERROR_OK)
@@ -1022,15 +1010,18 @@ static int xtensa_write_register(struct target *target, int idx)
 	if(res != ERROR_OK)
 		return res;
 
-	/* If we just wrote to the PC register or the EPC register we
-	   use as its alias, make sure to invalidate the other aliased
-	   register */
-	if(idx == XT_REG_IDX_PC) {
-		reg_list[XT_REG_IDX_PC_ALIAS].valid = 0;
-		reg_list[XT_REG_IDX_PC_ALIAS].dirty = 0;
-	} else if(idx == XT_REG_IDX_PC_ALIAS) {
-		reg_list[XT_REG_IDX_PC].valid = 0;
-		reg_list[XT_REG_IDX_PC].dirty = 0;
+	/* In case we just wrote to an aliased register, make sure to
+	   invalidate any other register sharing the same special
+	   register number */
+	if(xt_reg->type == XT_REG_ALIASED || xt_reg->type==XT_REG_SPECIAL) {
+		for(i = 0; i < XT_NUM_REGS; i++) {
+			xt_alias = reg_list[i].arch_info;
+			if((xt_alias->type == XT_REG_ALIASED || xt_alias->type == XT_REG_SPECIAL)
+			   && xt_alias->reg_num == xt_reg->reg_num) {
+				reg_list[i].valid = 0;
+				reg_list[i].dirty = 0;
+			}
+		}
 	}
 
 	reg->valid = 1;
@@ -1118,6 +1109,10 @@ static void xtensa_build_reg_cache(struct target *target)
 		assert(xt_regs[i].idx == i && "xt_regs[] entry idx field should match index in array");
 		arch_info[i] = xt_regs[i];
 		arch_info[i].target = target;
+		if(arch_info[i].type == XT_REG_ALIASED) {
+			/* NB: This is a constant at the moment, but will eventually be target-specific */
+			arch_info[i].reg_num += XT_DEBUGLEVEL;
+		}
 		reg_list[i].name = arch_info[i].name;
 		reg_list[i].size = 32;
 		reg_list[i].value = calloc(1,4);

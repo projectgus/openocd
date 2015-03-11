@@ -50,7 +50,7 @@ static inline struct xtensa_common *target_to_xtensa(struct target *target)
 
 enum xt_reg_t {
 	XT_REG_GENERAL = 0,
-	XT_REG_PC = 1,
+	XT_REG_ALIASED = 1,
 	XT_REG_SPECIAL = 2,
 };
 
