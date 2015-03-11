@@ -261,7 +261,11 @@ static int xtensa_get_core_reg(struct reg *reg);
 static int xtensa_set_core_reg(struct reg *reg, uint8_t *buf);
 static int xtensa_save_context(struct target *target);
 static int xtensa_restore_context(struct target *target);
-
+static int xtensa_read_memory(struct target *target,
+			      uint32_t address,
+			      uint32_t size,
+			      uint32_t count,
+			      uint8_t *buffer);
 
 /* Add an Xtensa OCD TAP instruction to the JTAG queue */
 static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *data_out, uint8_t *data_in)
@@ -692,6 +696,43 @@ static int xtensa_deassert_reset(struct target *target)
 	return ERROR_OK;
 }
 
+static int xtensa_read_buffer(struct target *target,
+			      uint32_t address,
+			      uint32_t count,
+			      uint8_t *buffer)
+{
+	uint8_t *aligned_buffer;
+	uint32_t aligned_address;
+	uint32_t aligned_count;
+	int res;
+
+	/* In case we are reading IRAM/IROM, extend our read to be
+	 * 32-bit aligned 32-bit reads */
+	aligned_address = address & ~3;
+	aligned_count = ((address + count + 3) & ~3) - aligned_address;
+
+	if (aligned_count != count)
+		aligned_buffer = malloc(aligned_count);
+	else
+		aligned_buffer = buffer;
+
+	LOG_DEBUG("%s: aligned_address=0x%" PRIx32 " aligned_count=0x%"
+		  PRIx32, __func__, aligned_address, aligned_count);
+
+	res = xtensa_read_memory(target, aligned_address,
+				 4, aligned_count/4,
+				 aligned_buffer);
+
+	if(aligned_count != count) {
+		if(res == ERROR_OK) {
+			memcpy(buffer, aligned_buffer + (address & 3), count);
+		}
+		free(aligned_buffer);
+	}
+
+	return res;
+}
+
 static int xtensa_read_memory_inner(struct target *target,
 				    uint32_t address,
 				    uint32_t size,
@@ -744,7 +785,6 @@ static int xtensa_read_memory_inner(struct target *target,
 	}
 	return ERROR_OK;
 }
-
 
 static int xtensa_read_memory(struct target *target,
 			      uint32_t address,
@@ -1159,6 +1199,8 @@ struct target_type xtensa_target = {
 
 	.read_memory = xtensa_read_memory,
 	.write_memory = xtensa_write_memory,
+
+	.read_buffer = xtensa_read_buffer,
 
 	.get_gdb_reg_list = xtensa_get_gdb_reg_list,
 
