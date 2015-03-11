@@ -261,11 +261,6 @@ static int xtensa_get_core_reg(struct reg *reg);
 static int xtensa_set_core_reg(struct reg *reg, uint8_t *buf);
 static int xtensa_save_context(struct target *target);
 static int xtensa_restore_context(struct target *target);
-static int xtensa_read_memory(struct target *target,
-			      uint32_t address,
-			      uint32_t size,
-			      uint32_t count,
-			      uint8_t *buffer);
 
 /* Add an Xtensa OCD TAP instruction to the JTAG queue */
 static int xtensa_tap_queue(struct target *target, int inst_idx, const uint8_t *data_out, uint8_t *data_in)
@@ -696,43 +691,6 @@ static int xtensa_deassert_reset(struct target *target)
 	return ERROR_OK;
 }
 
-static int xtensa_read_buffer(struct target *target,
-			      uint32_t address,
-			      uint32_t count,
-			      uint8_t *buffer)
-{
-	uint8_t *aligned_buffer;
-	uint32_t aligned_address;
-	uint32_t aligned_count;
-	int res;
-
-	/* In case we are reading IRAM/IROM, extend our read to be
-	 * 32-bit aligned 32-bit reads */
-	aligned_address = address & ~3;
-	aligned_count = ((address + count + 3) & ~3) - aligned_address;
-
-	if (aligned_count != count)
-		aligned_buffer = malloc(aligned_count);
-	else
-		aligned_buffer = buffer;
-
-	LOG_DEBUG("%s: aligned_address=0x%" PRIx32 " aligned_count=0x%"
-		  PRIx32, __func__, aligned_address, aligned_count);
-
-	res = xtensa_read_memory(target, aligned_address,
-				 4, aligned_count/4,
-				 aligned_buffer);
-
-	if(aligned_count != count) {
-		if(res == ERROR_OK) {
-			memcpy(buffer, aligned_buffer + (address & 3), count);
-		}
-		free(aligned_buffer);
-	}
-
-	return res;
-}
-
 static int xtensa_read_memory_inner(struct target *target,
 				    uint32_t address,
 				    uint32_t size,
@@ -937,6 +895,92 @@ static int xtensa_write_memory(struct target *target,
 
 	/* NB: if we were supporting the ICACHE option, we would need
 	 * to invalidate it here */
+
+	return res;
+}
+
+static int xtensa_read_buffer(struct target *target,
+			      uint32_t address,
+			      uint32_t count,
+			      uint8_t *buffer)
+{
+	uint8_t *aligned_buffer;
+	uint32_t aligned_address;
+	uint32_t aligned_count;
+	int res;
+
+	/* In case we are reading IRAM/IROM, extend our read to be
+	 * 32-bit aligned 32-bit reads */
+	aligned_address = address & ~3;
+	aligned_count = ((address + count + 3) & ~3) - aligned_address;
+
+	if (aligned_count != count)
+		aligned_buffer = malloc(aligned_count);
+	else
+		aligned_buffer = buffer;
+
+	LOG_DEBUG("%s: aligned_address=0x%" PRIx32 " aligned_count=0x%"
+		  PRIx32, __func__, aligned_address, aligned_count);
+
+	res = xtensa_read_memory(target, aligned_address,
+				 4, aligned_count/4,
+				 aligned_buffer);
+
+	if(aligned_count != count) {
+		if(res == ERROR_OK) {
+			memcpy(buffer, aligned_buffer + (address & 3), count);
+		}
+		free(aligned_buffer);
+	}
+
+	return res;
+}
+
+static int xtensa_write_buffer(struct target *target,
+			       uint32_t address,
+			       uint32_t count,
+			       const uint8_t *buffer)
+{
+	uint8_t *aligned_buffer = 0;
+	uint32_t aligned_address;
+	uint32_t aligned_count;
+	int res;
+
+	/* In case we are writing IRAM/IROM, extend our write to cover
+	 * 32-bit aligned 32-bit writes */
+	aligned_address = address & ~3;
+	aligned_count = ((address + count + 3) & ~3) - aligned_address;
+
+	if (aligned_count != count) {
+		aligned_buffer = malloc(aligned_count);
+		// Fill in head word with what's currently in memory
+		res = xtensa_read_buffer(target, aligned_address,
+					 4, aligned_buffer);
+		if(res != ERROR_OK)
+			goto cleanup;
+		if(aligned_count > 4) {
+			// Fill in tail word with what's currently in memory
+			res = xtensa_read_buffer(target,
+						 aligned_address+aligned_count-4,
+						 4, aligned_buffer+aligned_count-4);
+			if(res != ERROR_OK)
+				goto cleanup;
+		}
+		memcpy(aligned_buffer + (address & 3), buffer, count);
+		buffer = aligned_buffer;
+	}
+
+	LOG_DEBUG("%s: aligned_address=0x%" PRIx32 " aligned_count=0x%"
+		  PRIx32, __func__, aligned_address, aligned_count);
+
+	res = xtensa_write_memory(target, aligned_address,
+				  4, aligned_count/4,
+				  buffer);
+
+ cleanup:
+	if(aligned_buffer) {
+		free(aligned_buffer);
+	}
 
 	return res;
 }
@@ -1201,6 +1245,7 @@ struct target_type xtensa_target = {
 	.write_memory = xtensa_write_memory,
 
 	.read_buffer = xtensa_read_buffer,
+	.write_buffer = xtensa_write_buffer,
 
 	.get_gdb_reg_list = xtensa_get_gdb_reg_list,
 
