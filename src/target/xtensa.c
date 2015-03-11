@@ -1013,7 +1013,7 @@ static int xtensa_write_register(struct target *target, int idx)
 			xt_reg = reg_list[XT_REG_IDX_PC_ALIAS].arch_info;
 		}
 		value = buf_get_u32(reg->value, 0, 32);
-		res = xtensa_tap_queue_write_sr(target, idx, value);
+		res = xtensa_tap_queue_write_sr(target, xt_reg->idx, value);
 		if(res != ERROR_OK)
 			return res;
 	}
