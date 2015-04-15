@@ -455,16 +455,18 @@ static int xtensa_poll(struct target *target)
 				LOG_WARNING("%s: DOSR has set InOCDMode without the Exception flag. Unexpected. DOSR=0x%02x",
 					    __func__, dosr);
 			}
-			if(target->state == TARGET_DEBUG_RUNNING) {
-				target_call_event_callbacks(target, TARGET_EVENT_DEBUG_HALTED);
-			} else {
-				target_call_event_callbacks(target, TARGET_EVENT_HALTED);
-			}
+			int state = target->state;
 
 			xtensa->state = XT_OCD_HALT;
 			target->state = TARGET_HALTED;
 			xtensa_save_context(target);
 			register_cache_invalidate(xtensa->core_cache);
+
+			if(state == TARGET_DEBUG_RUNNING) {
+				target_call_event_callbacks(target, TARGET_EVENT_DEBUG_HALTED);
+			} else {
+				target_call_event_callbacks(target, TARGET_EVENT_HALTED);
+			}
 
 			LOG_DEBUG("target->state: %s", target_state_name(target));
 			pc = &xtensa->core_cache->reg_list[XT_REG_IDX_PC];
