@@ -22,7 +22,7 @@
 #define XTENSA_H
 
 #include <jtag/jtag.h>
-
+#include "breakpoints.h"
 
 enum xtensa_state {
 	XT_NORMAL,
@@ -34,6 +34,10 @@ struct xtensa_common {
 	struct jtag_tap *tap;
 	enum xtensa_state state;
 	struct reg_cache *core_cache;
+
+	uint32_t num_brps; /* Number of breakpoints available */
+	uint32_t free_brps; /* Number of free breakpoints */
+	struct breakpoint **hw_brps;
 };
 
 struct xtensa_tap_instr {

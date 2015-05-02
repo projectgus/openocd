@@ -50,6 +50,8 @@
  */
 #define XT_INS_NUM_BITS 24
 #define XT_DEBUGLEVEL    2 /* XCHAL_DEBUGLEVEL in xtensa-config.h */
+#define XT_NUM_BREAKPOINTS 1
+#define XT_NUM_WATCHPOINTS 1
 
 
 /*******************************************************************
@@ -361,7 +363,7 @@ static inline int xtensa_tap_queue_load_general_reg(struct target *target, uint8
 
    This function does not go through the gdb-facing register cache.
 */
-static int xtensa_tap_queue_write_sr(struct target *target, int idx, uint32_t value)
+static int xtensa_tap_queue_write_sr(struct target *target, enum xtensa_reg_idx idx, uint32_t value)
 {
 	struct xtensa_common *xtensa = target_to_xtensa(target);
 	struct reg *reg_list = xtensa->core_cache->reg_list;
@@ -401,6 +403,10 @@ static int xtensa_target_create(struct target *target, Jim_Interp *interp)
 	target->arch_info = xtensa;
 	xtensa->tap = target->tap;
 
+	xtensa->num_brps = XT_NUM_BREAKPOINTS;
+	xtensa->free_brps = XT_NUM_BREAKPOINTS;
+	xtensa->hw_brps = calloc(XT_NUM_BREAKPOINTS, sizeof(struct breakpoint *));
+
 	return ERROR_OK;
 }
 
@@ -416,7 +422,6 @@ static int xtensa_init_target(struct command_context *cmd_ctx, struct target *ta
 
 	xtensa->state = XT_NORMAL; // Assume normal state until we examine
 
-	/* TODO: Reset breakpoint state */
 
 	/* pre-seed TAP instruction buffer with tap instruction opcodes */
 	for(i = 0; i < XTENSA_NUM_TAP_INS; i++)
@@ -428,7 +433,7 @@ static int xtensa_init_target(struct command_context *cmd_ctx, struct target *ta
 static int xtensa_poll(struct target *target)
 {
 	struct xtensa_common *xtensa = target_to_xtensa(target);
-	struct reg *pc;
+	struct reg *reg;
 	uint32_t dosr;
 	int res;
 
@@ -469,8 +474,10 @@ static int xtensa_poll(struct target *target)
 			}
 
 			LOG_DEBUG("target->state: %s", target_state_name(target));
-			pc = &xtensa->core_cache->reg_list[XT_REG_IDX_PC];
-			LOG_INFO("halted: PC: 0x%" PRIx32, buf_get_u32(pc->value, 0, 32));
+			reg = &xtensa->core_cache->reg_list[XT_REG_IDX_PC];
+			LOG_INFO("halted: PC: 0x%" PRIx32, buf_get_u32(reg->value, 0, 32));
+			reg = &xtensa->core_cache->reg_list[XT_REG_IDX_DEBUGCAUSE];
+			LOG_INFO("debug cause: 0x%" PRIx32, buf_get_u32(reg->value, 0, 32));
 		}
 	} else if(target->state != TARGET_RUNNING && target->state != TARGET_DEBUG_RUNNING){
 		xtensa->state = XT_OCD_RUN;
@@ -481,7 +488,8 @@ static int xtensa_poll(struct target *target)
 
 static int xtensa_examine(struct target *target)
 {
-	int res;
+	int res = ERROR_OK;
+	size_t i;
 
 	if (!target_was_examined(target)) {
 		target_set_examined(target);
@@ -496,10 +504,20 @@ static int xtensa_examine(struct target *target)
 			return ERROR_FAIL;
 		}
 
-		/* TODO: Clear breakpoint state here as much as possible. */
+		if(target->state == TARGET_HALTED) {
+			LOG_DEBUG("Resetting breakpoint/watchpoint state...");
+			xtensa_tap_queue_write_sr(target, XT_REG_IDX_IBREAKENABLE, 0);
+			for(i = 0; i < XT_NUM_WATCHPOINTS; i++) {
+				xtensa_tap_queue_write_sr(target, XT_REG_IDX_DBREAKA0+i*2, 0);
+				xtensa_tap_queue_write_sr(target, XT_REG_IDX_DBREAKC0+i*2, 0);
+			}
+ 			res = jtag_execute_queue();
+		} else {
+			LOG_WARNING("Warning: Target not halted, breakpoint/watchpoint state may be unpredictable.");
+		}
 	}
 
-	return ERROR_OK;
+	return res;
 }
 
 
@@ -987,6 +1005,109 @@ static int xtensa_write_buffer(struct target *target,
 	return res;
 }
 
+static int xtensa_set_breakpoint(struct target *target, struct breakpoint *breakpoint)
+{
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+	struct reg *reg_list = xtensa->core_cache->reg_list;
+	size_t slot;
+	int res;
+
+	for(slot = 0; slot < xtensa->num_brps; slot++) {
+		if(xtensa->hw_brps[slot] == NULL || xtensa->hw_brps[slot] == breakpoint)
+			break;
+	}
+	assert(slot < xtensa->num_brps && "Breakpoint slot should always be available to set breakpoint");
+
+	/* Write IBREAKA[slot] and set bit #slot in IBREAKENABLE */
+	enum xtensa_reg_idx bp_reg_idx = XT_REG_IDX_IBREAKA0+slot;
+	xtensa_tap_queue_write_sr(target, bp_reg_idx, breakpoint->address);
+	uint32_t ibe_val = buf_get_u32(reg_list[XT_REG_IDX_IBREAKENABLE].value, 0, 32);
+	ibe_val |= (1<<slot);
+	xtensa_tap_queue_write_sr(target, XT_REG_IDX_IBREAKENABLE, ibe_val);
+
+	res = jtag_execute_queue();
+	if(res != ERROR_OK)
+		return res;
+
+	xtensa->hw_brps[slot] = breakpoint;
+
+	/* invalidate register cache */
+	reg_list[XT_REG_IDX_IBREAKENABLE].valid = 0;
+	reg_list[bp_reg_idx].valid = 0;
+
+	return ERROR_OK;
+}
+
+static int xtensa_add_breakpoint(struct target *target, struct breakpoint *breakpoint)
+{
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+
+	if (target->state != TARGET_HALTED) {
+		LOG_WARNING("target not halted");
+		return ERROR_TARGET_NOT_HALTED;
+	}
+
+	if (breakpoint->type == BKPT_SOFT) {
+		LOG_ERROR("sw breakpoint requested, but software breakpoints not enabled");
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+
+	if (!xtensa->free_brps) {
+		LOG_ERROR("no free breakpoint available for hardware breakpoint");
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+	xtensa->free_brps--;
+
+	return xtensa_set_breakpoint(target, breakpoint);
+}
+
+static int xtensa_unset_breakpoint(struct target *target, struct breakpoint *breakpoint)
+{
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+	struct reg *reg_list = xtensa->core_cache->reg_list;
+	size_t slot;
+	int res;
+
+	for(slot = 0; slot < xtensa->num_brps; slot++) {
+		if(xtensa->hw_brps[slot] == breakpoint)
+			break;
+	}
+	assert(slot < xtensa->num_brps && "Breakpoint slot not found");
+
+	uint32_t ibe_val = buf_get_u32(reg_list[XT_REG_IDX_IBREAKENABLE].value, 0, 32);
+	ibe_val &= ~(1<<slot);
+	xtensa_tap_queue_write_sr(target, XT_REG_IDX_IBREAKENABLE, ibe_val);
+
+	res = jtag_execute_queue();
+	if(res != ERROR_OK)
+		return res;
+
+	xtensa->hw_brps[slot] = NULL;
+
+	/* invalidate register cache */
+	reg_list[XT_REG_IDX_IBREAKENABLE].valid = 0;
+	return ERROR_OK;
+}
+
+static int xtensa_remove_breakpoint(struct target *target, struct breakpoint *breakpoint)
+{
+	struct xtensa_common *xtensa = target_to_xtensa(target);
+	int res;
+
+	if (target->state != TARGET_HALTED) {
+		LOG_WARNING("target not halted");
+		return ERROR_TARGET_NOT_HALTED;
+	}
+
+	res = xtensa_unset_breakpoint(target, breakpoint);
+	if(res == ERROR_OK) {
+		xtensa->free_brps++;
+		assert(xtensa->free_brps <= xtensa->num_brps && "Free breakpoint count should always be less than max breakpoints");
+	}
+	return res;
+}
+
+
 /* Read register value from target. This function goes via the gdb-facing register cache. */
 static int xtensa_read_register(struct target *target, int idx, int force)
 {
@@ -1053,7 +1174,7 @@ static int xtensa_read_register(struct target *target, int idx, int force)
 	return ERROR_OK;
 }
 
-static int xtensa_write_register(struct target *target, int idx)
+static int xtensa_write_register(struct target *target, enum xtensa_reg_idx idx)
 {
 	struct xtensa_common *xtensa = target_to_xtensa(target);
 	struct reg *reg_list = xtensa->core_cache->reg_list;
@@ -1251,16 +1372,13 @@ struct target_type xtensa_target = {
 
 	.get_gdb_reg_list = xtensa_get_gdb_reg_list,
 
+	.add_breakpoint = xtensa_add_breakpoint,
+	.remove_breakpoint = xtensa_remove_breakpoint,
 	/*
-	  .run_algorithm = xtensa_run_algorithm,
-
-	  .add_breakpoint = xtensa_add_breakpoint,
-	  .remove_breakpoint = xtensa_remove_breakpoint,
-	  .add_watchpoint = xtensa_add_watchpoint,
-	  .remove_watchpoint = xtensa_remove_watchpoint,
-
-	  .commands = xtensa_command_handlers,
+	.add_watchpoint = xtensa_add_watchpoint,
+	.remove_watchpoint = xtensa_remove_watchpoint,
 	*/
+
 	.target_create = xtensa_target_create,
 	.init_target = xtensa_init_target,
 	.examine = xtensa_examine,
