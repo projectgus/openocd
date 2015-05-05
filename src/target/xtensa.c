@@ -464,8 +464,8 @@ static int xtensa_poll(struct target *target)
 
 			xtensa->state = XT_OCD_HALT;
 			target->state = TARGET_HALTED;
-			xtensa_save_context(target);
 			register_cache_invalidate(xtensa->core_cache);
+			xtensa_save_context(target);
 
 			if(state == TARGET_DEBUG_RUNNING) {
 				target_call_event_callbacks(target, TARGET_EVENT_DEBUG_HALTED);
