@@ -38,6 +38,7 @@
 #include "target_type.h"
 #include "register.h"
 #include "assert.h"
+#include "time_support.h"
 
 #include "xtensa.h"
 
@@ -588,8 +589,6 @@ static int xtensa_step(struct target *target,
 	uint32_t address,
 	int handle_breakpoints)
 {
-	struct xtensa_common *xtensa = target_to_xtensa(target);
-	struct reg *reg_list = xtensa->core_cache->reg_list;
 	int res;
 	uint32_t dosr;
 	static const uint32_t icount_val = -2; /* ICOUNT value to load for 1 step */
@@ -645,27 +644,26 @@ static int xtensa_step(struct target *target,
 	}
 
 	/* Wait for stepping to complete */
-	do {
-		res = xtensa_tap_exec(target, TAP_INS_READ_DOSR, 0, &dosr);
-		if(res != ERROR_OK) {
-			LOG_ERROR("Failed to read DOSR. Not Xtensa OCD?");
-			return ERROR_FAIL;
-		}
-	} while(!(dosr & DOSR_IN_OCD_MODE) || (dosr & DOSR_EXCEPTION));
+	int64_t start = timeval_ms();
+	while(target->state != TARGET_HALTED && timeval_ms() < start+500) {
+		res = target_poll(target);
+		if(res != ERROR_OK)
+			return res;
+		if(target->state != TARGET_HALTED)
+			usleep(50000);
+	}
+	if(target->state != TARGET_HALTED) {
+		LOG_ERROR("%s: Timed out waiting for target to finish stepping.", __func__);
+		return ERROR_TARGET_TIMEOUT;
+	}
 
 	/* write ICOUNTLEVEL back to zero */
 	res = xtensa_tap_queue_write_sr(target, XT_REG_IDX_ICOUNTLEVEL, 0);
 	if(res != ERROR_OK)
 		return res;
 	res = jtag_execute_queue();
-	if(res != ERROR_OK)
-		return res;
 
-	xtensa_save_context(target);
-	target->debug_reason = DBG_REASON_SINGLESTEP;
-	target_call_event_callbacks(target, TARGET_EVENT_HALTED);
-	LOG_INFO("halted: PC: 0x%" PRIx32, buf_get_u32(reg_list[XT_REG_IDX_PC].value, 0, 32));
-	return ERROR_OK;
+	return res;
 }
 
 
