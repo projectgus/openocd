@@ -307,9 +307,14 @@ static int xtensa_tap_exec(struct target *target, int inst_idx, uint32_t data_ou
 
 
 	if(data_in) {
+		static uint32_t last_dosr;
 		*data_in = buf_get_u32(in, 0, 32);
-		LOG_DEBUG("Executed %s, data_out=0x%" PRIx32 " data_in=0x%" PRIx32,
-			  tap_instrs[inst_idx].name, data_out, *data_in);
+		if(inst_idx != TAP_INS_READ_DOSR || *data_in != last_dosr) {
+			LOG_DEBUG("Executed %s, data_out=0x%" PRIx32 " data_in=0x%" PRIx32,
+				  tap_instrs[inst_idx].name, data_out, *data_in);
+			if(inst_idx == TAP_INS_READ_DOSR)
+				last_dosr = *data_in;
+		}
 	} else {
 		LOG_DEBUG("Executed %s, data_out=0x%" PRIx32,
 			  tap_instrs[inst_idx].name, data_out);
