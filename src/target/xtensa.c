@@ -572,7 +572,15 @@ static int xtensa_resume(struct target *target,
 		LOG_ERROR("Failed to issue LoadDI instruction. Can't resume.");
 		return ERROR_FAIL;
 	}
-	return ERROR_OK;
+
+	target->debug_reason = DBG_REASON_NOTHALTED;
+	if (!debug_execution)
+		target->state = TARGET_RUNNING;
+	else
+		target->state = TARGET_DEBUG_RUNNING;
+	res = target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
+
+	return res;
 }
 
 static int xtensa_step(struct target *target,
